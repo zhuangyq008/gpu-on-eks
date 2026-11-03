@@ -1,0 +1,32 @@
+[project]
+name = "qwenctl"
+version = "0.1.0"
+description = "Qwen-VL on EKS 交互式部署工具（在客户 CloudShell 中运行）"
+requires-python = ">=3.9"
+dependencies = ["boto3"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["qwenctl"]
+omit = ["qwenctl/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+
+[tool.black]
+line-length = 110
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+# CloudShell 的 python3 可能是 3.9：统一用 typing.Optional/Dict 写法，
+# 避免类型别名等运行时表达式里出现 3.9 不支持的 `X | None`
+ignore = ["UP006", "UP035", "UP045"]

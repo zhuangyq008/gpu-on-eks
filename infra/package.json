@@ -1,0 +1,26 @@
+{
+  "name": "qwen-vl-infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Qwen-VL on EKS 的 CDK 工程，输入是 qwenctl 生成的部署配置 JSON",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --coverage",
+    "synth": "npm run build && cdk synth"
+  },
+  "dependencies": {
+    "aws-cdk": "2.1147.0",
+    "aws-cdk-lib": "2.275.0",
+    "constructs": "10.8.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/node": "22.20.5",
+    "jest": "30.5.2",
+    "ts-jest": "29.4.15",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

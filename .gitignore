@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / CDK
+node_modules/
+cdk.out/
+infra/dist/
+cdk.context.json
+coverage/
+*.js.map
+
+# qwenctl 本地生成的部署配置（含账号信息）
+.qwenctl/

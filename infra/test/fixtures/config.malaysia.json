@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "name": "qwen-vl",
+  "account": "123456789012",
+  "region": "ap-southeast-5",
+  "adminPrincipalArn": "arn:aws:iam::123456789012:role/Admin",
+  "zones": [
+    {
+      "zoneId": "apse5-az1",
+      "zoneName": "ap-southeast-5a"
+    },
+    {
+      "zoneId": "apse5-az2",
+      "zoneName": "ap-southeast-5b"
+    }
+  ],
+  "network": {
+    "mode": "new",
+    "cidr": "10.100.0.0/16",
+    "secondaryCidrs": [],
+    "vpcId": null,
+    "privateSubnets": [],
+    "publicSubnets": [],
+    "endpoints": {
+      "interface": [
+        "ecr.api",
+        "ecr.dkr",
+        "sts",
+        "eks-auth",
+        "sqs"
+      ],
+      "s3Gateway": true,
+      "s3RouteTableIds": []
+    }
+  },
+  "access": {
+    "mode": "internal",
+    "certificateArn": null,
+    "allowedCidrs": [],
+    "openToInternet": false
+  },
+  "gpu": {
+    "minReplicas": 2,
+    "maxReplicas": 8,
+    "profiles": [
+      {
+        "name": "g7e-1gpu",
+        "instanceTypes": [
+          "g7e.2xlarge",
+          "g7e.4xlarge"
+        ],
+        "tensorParallel": 1,
+        "replicasPerNode": 1,
+        "nodepoolWeight": 100,
+        "experimental": false,
+        "zoneIds": [
+          "apse5-az2"
+        ]
+      },
+      {
+        "name": "g6-tp2",
+        "instanceTypes": [
+          "g6.12xlarge"
+        ],
+        "tensorParallel": 2,
+        "replicasPerNode": 2,
+        "nodepoolWeight": 10,
+        "experimental": true,
+        "zoneIds": [
+          "apse5-az1",
+          "apse5-az2"
+        ]
+      }
+    ]
+  },
+  "systemNodes": {
+    "instanceType": "m7g.large"
+  },
+  "features": {
+    "asyncChannel": true,
+    "bedrockOverflow": false,
+    "alertEmail": null
+  },
+  "observability": {
+    "mode": "cloudwatch"
+  },
+  "advanced": {
+    "serving": {
+      "max_model_len": 32768,
+      "max_images_per_request": 4,
+      "max_image_pixels": 2097152,
+      "gpu_memory_utilization": 0.92
+    },
+    "scaling": {
+      "c_sla": {},
+      "target_utilization": 0.65,
+      "waiting_threshold": 4,
+      "kv_cache_threshold": 0.8,
+      "warm_node_minutes": 10,
+      "schedule": null
+    },
+    "capacity": {
+      "extra_fallback_types": []
+    },
+    "general_nodes": {
+      "arch": [
+        "amd64"
+      ],
+      "capacity_types": [
+        "on-demand"
+      ],
+      "cpu_limit": 200
+    },
+    "network": {
+      "cidr": "10.100.0.0/16",
+      "nat_gateways": 1,
+      "eks_endpoint": "public-and-private",
+      "interface_endpoints": "auto"
+    },
+    "compliance": {
+      "kms_key_arn": null,
+      "tags": {},
+      "extra_admin_role_arns": []
+    },
+    "observability": {
+      "amp": "auto",
+      "log_retention_days": {
+        "app": 14,
+        "access": 30,
+        "coldstart": 90
+      }
+    },
+    "image": {
+      "source_registry": "docker.io",
+      "credentials_secret_arn": null
+    },
+    "cdk": {
+      "bootstrap_qualifier": null
+    }
+  }
+}

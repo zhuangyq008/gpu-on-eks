@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# qwenctl 启动脚本：在 CloudShell 里进入交付包目录后运行 ./qwenctl deploy
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${ROOT}/cli${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m qwenctl "$@"

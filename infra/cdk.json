@@ -1,0 +1,9 @@
+{
+  "app": "node dist/bin/app.js",
+  "context": {
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true,
+    "@aws-cdk/core:defaultCrossStackReferences": "strong"
+  }
+}

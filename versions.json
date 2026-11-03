@@ -1,0 +1,43 @@
+{
+  "_comment": "锁定版本（docs/03 §3.4）。Python（qwenctl）和 CDK 都读这个文件；升级时整体验证后一起改。2026-11-03 核对。",
+  "kubernetes": "1.36",
+  "bottlerocket": "v1.68.1",
+  "eksAddons": {
+    "vpc-cni": "v1.22.4-eksbuild.10",
+    "kube-proxy": "v1.36.0-eksbuild.58",
+    "coredns": "v1.14.7-eksbuild.22",
+    "eks-pod-identity-agent": "v1.4.1-eksbuild.3",
+    "eks-node-monitoring-agent": "v1.7.6-eksbuild.1"
+  },
+  "tools": {
+    "kubectl": {
+      "version": "v1.36.6",
+      "url": "https://dl.k8s.io/release/{version}/bin/linux/{arch}/kubectl",
+      "sha256": {
+        "amd64": "29818b6729dc9262b692307470d0558d027725e738be5dd47c760261868a2634",
+        "arm64": "35507ef408c3d38849e5d3203e18f8e861db822aa664101a9ced0869edd06046"
+      }
+    },
+    "helm": {
+      "version": "v3.22.1",
+      "url": "https://get.helm.sh/helm-{version}-linux-{arch}.tar.gz",
+      "archiveMember": "linux-{arch}/helm",
+      "sha256": {
+        "amd64": "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea",
+        "arm64": "4c29e286b279d170fa048ddfc3e4e83dcd069ca9c52102766ba672d7149e694d"
+      }
+    }
+  },
+  "charts": {
+    "karpenter-crd": {
+      "repository": "oci://public.ecr.aws/karpenter",
+      "version": "1.15.1",
+      "sha256": "ac74198d42c9a327a59ee0f6eabd2df854015100e1aff54c06673a42a0759546"
+    },
+    "karpenter": {
+      "repository": "oci://public.ecr.aws/karpenter",
+      "version": "1.15.1",
+      "sha256": "51f74d19d578847804ffce7b22a0d87d89e540e90067f2bd392d9e19b71990fe"
+    }
+  }
+}
