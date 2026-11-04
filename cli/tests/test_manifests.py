@@ -48,8 +48,54 @@ def test_nodeclass_uses_stack_outputs_pinned_ami_and_imdsv2(manifests):
     assert spec["metadataOptions"]["httpPutResponseHopLimit"] == 1
     assert all(d["ebs"]["encrypted"] for d in spec["blockDeviceMappings"])
     assert spec["tags"]["qwenctl:deployment"] == "qwen-vl"
-    gpu = _by(manifests, "EC2NodeClass", "gpu")["spec"]["blockDeviceMappings"][1]["ebs"]
-    assert gpu["volumeSize"] == "150Gi" and gpu["iops"] == 16000
+
+
+def test_gpu_nodes_pull_images_onto_local_nvme_with_parallel_soci(manifests):
+    gpu = _by(manifests, "EC2NodeClass", "gpu")["spec"]
+    assert gpu["instanceStorePolicy"] == "RAID0"
+    # 镜像和临时存储都在 NVMe 上，数据盘回到 gp3 默认性能；AMI 自带的数据盘快照 18 GiB，不能更小
+    assert gpu["blockDeviceMappings"][1]["ebs"] == {
+        "volumeSize": "30Gi",
+        "volumeType": "gp3",
+        "encrypted": True,
+    }
+    settings = _toml(gpu["userData"])["settings"]
+    assert settings["container-runtime"]["snapshotter"] == "soci"
+    soci = settings["container-runtime-plugins"]["soci-snapshotter"]
+    assert soci["pull-mode"] == "parallel-pull-unpack"
+    assert soci["parallel-pull-unpack"]["max-concurrent-downloads-per-image"] == 20
+    assert soci["parallel-pull-unpack"]["concurrent-download-chunk-size"] == "16mb"
+    # 通用节点（客户业务）的机型大多没有 NVMe：不能加 RAID0（essential 的启动命令会失败），也不改运行时
+    general = _by(manifests, "EC2NodeClass", "general")["spec"]
+    assert "instanceStorePolicy" not in general and "userData" not in general
+
+
+def _toml(text):
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError:  # 3.9 / 3.10：只做最基本的解析，足够覆盖这份 userData
+        return _mini_toml(text)
+    return tomllib.loads(text)
+
+
+def _mini_toml(text):
+    root, table = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            table = root
+            for part in line.strip("[]").split("."):
+                table = table.setdefault(part, {})
+            continue
+        key, value = (x.strip() for x in line.split("=", 1))
+        table[key] = (
+            value.strip('"')
+            if value.startswith('"')
+            else (value == "true" if value in ("true", "false") else int(value))
+        )
+    return root
 
 
 def test_general_nodepool_for_customer_workloads(manifests):

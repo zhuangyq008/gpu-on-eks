@@ -3,6 +3,7 @@ import re
 
 import pytest
 
+from qwenctl import compile_cache
 from qwenctl.serving import (
     base_manifests,
     image_ref,
@@ -91,8 +92,9 @@ def test_base_manifests_share_one_service(config):
         ("ServiceAccount", "vllm"),
         ("ServiceAccount", "model-sync"),
         ("Service", "qwen-vl"),
+        ("ConfigMap", compile_cache.configmap_name()),
     ]
-    service = base_manifests(config)[-1]
+    service = next(m for m in base_manifests(config) if m["kind"] == "Service")
     assert service["spec"]["selector"] == {"app": "qwen-vl"}
 
 
@@ -148,3 +150,41 @@ def test_job_name_changes_whenever_the_pod_template_changes(config, monkeypatch,
     changed.write_text("print('v2')", encoding="utf-8")
     monkeypatch.setattr(serving, "SYNC_SCRIPT", str(changed))
     assert name() != before  # 脚本变了（ConfigMap 名字也跟着变）
+
+
+def _pod_spec(config, name="vllm-g6-tp2"):
+    deployment = next(d for d in vllm_deployments(config, VERSIONS, BUCKET) if d["metadata"]["name"] == name)
+    return deployment["spec"]["template"]
+
+
+def test_vllm_restores_compile_cache_before_starting(config):
+    template = _pod_spec(config)
+    key = template["metadata"]["annotations"][compile_cache.ANNOTATION]
+    assert key.startswith("compile-cache/g6-tp2/") and key.endswith("/vllm-cache.tar.gz")
+    (init,) = template["spec"]["initContainers"]
+    vllm = template["spec"]["containers"][0]
+    assert init["image"] == vllm["image"]  # 复用 vLLM 镜像，节点上已经有了
+    assert init["command"][-3:] == [BUCKET, key, "/models/vllm-cache"]
+    assert {"name": "cache", "mountPath": "/models"} in init["volumeMounts"]
+    assert init["securityContext"] == vllm["securityContext"]
+    env = {e["name"]: e["value"] for e in vllm["env"]}
+    assert env["VLLM_CACHE_ROOT"] == "/models/vllm-cache"
+    volumes = {v["name"]: v for v in template["spec"]["volumes"]}
+    assert volumes["compile-cache-restore"]["configMap"]["name"] == compile_cache.configmap_name()
+
+
+def test_compile_cache_key_changes_with_anything_that_affects_compiled_code(config):
+    def key(cfg=config, versions=VERSIONS, name="vllm-g6-tp2"):
+        deployment = next(d for d in vllm_deployments(cfg, versions, BUCKET) if d["metadata"]["name"] == name)
+        return deployment["spec"]["template"]["metadata"]["annotations"][compile_cache.ANNOTATION]
+
+    base = key()
+    assert key() == base
+    assert key(name="vllm-g7e-1gpu") != base  # 不同 GPU
+    other_image = {
+        **VERSIONS,
+        "images": {"vllm": {**VERSIONS["images"]["vllm"], "digest": "sha256:" + "1" * 64}},
+    }
+    assert key(versions=other_image) != base
+    serving = {**config["advanced"]["serving"], "max_num_seqs": 8}
+    assert key(cfg={**config, "advanced": {**config["advanced"], "serving": serving}}) != base  # vLLM 参数

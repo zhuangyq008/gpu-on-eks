@@ -12,6 +12,7 @@ import json
 import os
 from typing import AbstractSet, Any, Dict, List, Mapping, Optional
 
+from . import compile_cache
 from .addons import namespace_manifest
 
 Manifest = Dict[str, Any]
@@ -79,6 +80,7 @@ def base_manifests(config: Mapping[str, Any]) -> List[Manifest]:
         _service_account(ns, serving["vllmServiceAccount"]),
         _service_account(ns, serving["syncServiceAccount"]),
         service,
+        compile_cache.configmap(ns),
     ]
 
 
@@ -208,16 +210,24 @@ def vllm_deployment(
 ) -> Manifest:
     labels = {**APP_LABEL, "qwenctl/gpu-profile": profile["name"]}
     gpus = profile["tensorParallel"]
+    image, args = image_ref(versions), vllm_args(config, versions, bucket, profile)
+    cache_key = compile_cache.cache_key(
+        prefix=config["serving"]["compileCachePrefix"],
+        profile=profile["name"],
+        image=image,
+        revision=versions["model"]["revision"],
+        args=args,
+    )
     env = {
         "AWS_REGION": config["region"],
         "HF_HUB_OFFLINE": "1",  # 启动过程不访问外网
-        "VLLM_CACHE_ROOT": "/models/vllm-cache",
+        "VLLM_CACHE_ROOT": compile_cache.CACHE_ROOT,
     }
     container = {
-        "name": "vllm",
-        "image": image_ref(versions),
+        "name": compile_cache.VLLM_CONTAINER,
+        "image": image,
         "command": ["vllm", "serve"],
-        "args": vllm_args(config, versions, bucket, profile),
+        "args": args,
         "env": [{"name": k, "value": v} for k, v in env.items()],
         "ports": [{"name": "http", "containerPort": VLLM_PORT}],
         "resources": {
@@ -228,7 +238,10 @@ def vllm_deployment(
         "readinessProbe": _probe(5, 3),
         # 先从网关摘掉流量，再停止接收请求
         "lifecycle": {"preStop": {"exec": {"command": ["sleep", "15"]}}},
-        "volumeMounts": [{"name": "cache", "mountPath": "/models"}, {"name": "shm", "mountPath": "/dev/shm"}],
+        "volumeMounts": [
+            {"name": compile_cache.VOLUME, "mountPath": compile_cache.MOUNT},
+            {"name": "shm", "mountPath": "/dev/shm"},
+        ],
         "securityContext": BASE_SECURITY_CONTEXT,
     }
     deployment = {
@@ -244,7 +257,8 @@ def vllm_deployment(
             "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}},
             "selector": {"matchLabels": labels},
             "template": {
-                "metadata": {"labels": labels},
+                # qwenctl 从就绪的 Pod 上读这个 key，把它冷编译出来的缓存存到 S3
+                "metadata": {"labels": labels, "annotations": {compile_cache.ANNOTATION: cache_key}},
                 "spec": {
                     "serviceAccountName": config["serving"]["vllmServiceAccount"],
                     "nodeSelector": {"qwenctl/gpu-profile": profile["name"]},
@@ -258,10 +272,21 @@ def vllm_deployment(
                         }
                     ],
                     "terminationGracePeriodSeconds": 180,
+                    "initContainers": [
+                        compile_cache.restore_container(
+                            image=image,
+                            bucket=bucket,
+                            key=cache_key,
+                            region=config["region"],
+                            security_context=BASE_SECURITY_CONTEXT,
+                        )
+                    ],
                     "containers": [container],
                     "volumes": [
-                        {"name": "cache", "emptyDir": {}},
+                        # 编译缓存约 250 MB；上限防止异常内容写满节点的临时存储
+                        {"name": compile_cache.VOLUME, "emptyDir": {"sizeLimit": "20Gi"}},
                         {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Gi"}},
+                        compile_cache.restore_volume(),
                     ],
                 },
             },

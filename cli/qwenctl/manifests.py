@@ -33,6 +33,25 @@ def gpu_limit(profile: Mapping[str, Any], max_replicas: int) -> int:
     return math.ceil(max_replicas / per_node) * gpus_per_node
 
 
+# GPU 节点（目录里的 GPU 机型都带本地 NVMe）：
+# - instanceStorePolicy RAID0：Karpenter 把 NVMe 组成 RAID0，containerd、kubelet、Pod 临时存储都放上去，
+#   EBS 数据盘只剩系统数据和日志（AMI 自带的数据盘快照是 18 GiB，不能更小）
+# - SOCI 并行下载 + 并行解压（不需要 SOCI index）：默认参数很保守（每个镜像 3 路下载、不分块、1 路解压），
+#   按 AWS 的推荐值调大。vLLM 镜像 9.2 GB，只有几个超过 1 GB 的大层，解压并发再大没有意义
+GPU_USER_DATA = """[settings.container-runtime]
+snapshotter = "soci"
+
+[settings.container-runtime-plugins.soci-snapshotter]
+pull-mode = "parallel-pull-unpack"
+
+[settings.container-runtime-plugins.soci-snapshotter.parallel-pull-unpack]
+max-concurrent-downloads-per-image = 20
+concurrent-download-chunk-size = "16mb"
+max-concurrent-unpacks-per-image = 4
+discard-unpacked-layers = true
+"""
+
+
 def render(config: Mapping[str, Any], outputs: Mapping[str, str], bottlerocket: str) -> List[Manifest]:
     """config 是 qwenctl 保存的部署配置（JSON 契约），outputs 是 EKS 栈的 CloudFormation 输出。"""
     node_role = _required(outputs, "KarpenterNodeRoleName")
@@ -58,9 +77,8 @@ def render(config: Mapping[str, Any], outputs: Mapping[str, str], bottlerocket: 
         _nodeclass("general", base, data_volume={"volumeSize": "50Gi", "volumeType": "gp3"}),
         _nodeclass(
             "gpu",
-            base,
-            # 后续会挂上预缓存 vLLM 镜像的 EBS 快照（docs/01 §4.2）
-            data_volume={"volumeSize": "150Gi", "volumeType": "gp3", "iops": 16000, "throughput": 1000},
+            {**base, "instanceStorePolicy": "RAID0", "userData": GPU_USER_DATA},
+            data_volume={"volumeSize": "30Gi", "volumeType": "gp3"},
         ),
         _general_nodepool(config["advanced"]["general_nodes"], zone_ids),
     ]

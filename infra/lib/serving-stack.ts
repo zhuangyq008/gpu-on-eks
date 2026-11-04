@@ -2,7 +2,9 @@
  * 推理服务栈：模型权重桶 + vLLM / 权重同步 Job 的 Pod Identity 角色。
  *
  * - vLLM 用 Run:ai Model Streamer 从这个桶流式加载权重（经 S3 网关终端节点，不走 NAT）
- * - vLLM 只读 models/*；同步 Job 可读写 models/* 但不能删除
+ * - vLLM 只读 models/* 和 compile-cache/*；同步 Job 可读写 models/* 但不能删除
+ * - 编译缓存里有生成的代码，被投毒等于在之后所有 vLLM Pod 里执行代码：vLLM 不能写，
+ *   由 qwenctl 用部署者自己的凭证从刚启动的 Pod 里打包上传
  * - 桶开启版本控制：同步 Job 有覆盖写权限，权重被替换也能回滚（同步时逐文件校验 HF 的哈希）
  * - 桶删栈时保留（权重 37.5 GB，误删要重新下载），由 qwenctl destroy 确认后清理
  */
@@ -50,6 +52,7 @@ export class ServingStack extends cdk.Stack {
       description: `vLLM of ${config.name}: read model weights`,
     });
     this.modelBucket.grantRead(vllm, keys);
+    this.modelBucket.grantRead(vllm, `${serving.compileCachePrefix}*`);
 
     const sync = podIdentityRole(this, 'ModelSyncRole', {
       clusterName: config.name,

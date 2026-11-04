@@ -374,3 +374,17 @@ def test_resume_rejects_c_sla_for_unknown_profile_before_installing(gw, tmp_path
     con, out = make_console()
     assert main(["deploy", "--update"], _factory(gw), con, install) == EXIT_CONFIG_ERROR
     assert install.requests == [] and "g7e-1gpus" in out.getvalue()
+
+
+def test_resume_rejects_overlapping_bucket_prefixes(gw, tmp_path, monkeypatch):
+    """同步 Job 能写模型前缀；缓存前缀落在它下面，就等于同步 Job 能往编译缓存里写代码。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["serving"]["compileCachePrefix"] = "models/cache/"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    con, out = make_console()
+    assert main(["deploy", "--resume"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    assert "serving 的命名格式不对" in out.getvalue()

@@ -22,6 +22,7 @@ from qwenctl.installer import (
 )
 from qwenctl.paths import DeploymentPaths
 from qwenctl.runner import CommandError, CommandResult
+from qwenctl.serving import vllm_deployments
 from qwenctl.versions import load_versions
 
 from .conftest import make_console
@@ -57,6 +58,19 @@ READY_POD = {
 }
 
 
+def _cache_archive(members=None) -> bytes:
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name, data in (members or {"torch_compile_cache/abc/model.py": b"compiled"}).items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
 class FakeRunner:
     def __init__(
         self,
@@ -67,6 +81,10 @@ class FakeRunner:
         deployments: Optional[Dict[str, int]] = None,
         get_error: bool = False,
         synced: bool = False,
+        cached: bool = False,
+        capture_bytes: Optional[bytes] = None,
+        capture_fails: bool = False,
+        put_error: Optional[str] = None,
     ) -> None:
         self.calls: List[dict] = []
         self.fail_on = fail_on
@@ -77,6 +95,10 @@ class FakeRunner:
         self.get_error = get_error
         self.head_error = "An error occurred (404) when calling the HeadObject operation: Not Found"
         self.synced = synced
+        self.cached = cached
+        self.capture_bytes = capture_bytes if capture_bytes is not None else _cache_archive()
+        self.capture_fails = capture_fails
+        self.put_error = put_error
 
     def run(
         self, args: Sequence[str], *, cwd=None, input_text=None, capture=False, env=None
@@ -103,8 +125,13 @@ class FakeRunner:
             return CommandResult(
                 0, json.dumps([{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()])
             )
-        if "head-object" in args and not self.synced:
-            raise CommandError(args, 254, self.head_error)
+        if "put-object" in args and self.put_error:
+            raise CommandError(args, 254, self.put_error)
+        if "head-object" in args:
+            key = args[args.index("--key") + 1]
+            exists = self.synced if key.endswith("_COMPLETE") else self.cached
+            if not exists:
+                raise CommandError(args, 254, self.head_error)
         if "get" in args and "job" in args:
             return CommandResult(0, json.dumps({"status": self.job_status}))
         if "get" in args and "pods" in args:
@@ -117,6 +144,17 @@ class FakeRunner:
         if "logs" in args:
             return CommandResult(0, "Traceback: boom")
         return CommandResult(0, "")
+
+    def run_to_file(self, args: Sequence[str], path: str, max_bytes: int, ok_returncodes=(0,)) -> int:
+        self.capture_ok_returncodes = tuple(ok_returncodes)
+        self.calls.append({"args": list(args), "cwd": None, "input": None, "capture": True, "env": None})
+        if self.capture_fails:
+            raise CommandError(args, 1, "container not found")
+        if len(self.capture_bytes) > max_bytes:
+            raise CommandError(args, 1, f"输出超过 {max_bytes} 字节，已停止")
+        with open(path, "wb") as handle:
+            handle.write(self.capture_bytes)
+        return len(self.capture_bytes)
 
     def commands(self) -> List[str]:
         return [" ".join(c["args"]) for c in self.calls]
@@ -564,3 +602,154 @@ def test_bad_profile_name_in_saved_config_is_an_install_error(tmp_path):
     with pytest.raises(InstallError, match="PromQL") as err:
         run_install(ctx, resume=False)
     assert err.value.phase == "serving"
+
+
+def _expected_key(tmp_path, profile="g7e-1gpu"):
+    """按配置算出的 key（和 installer 用来校验的是同一份）。"""
+    ctx, _ = _ctx(tmp_path / "probe", FakeRunner())
+    deployments = vllm_deployments(ctx.config, ctx.versions, SERVING_OUTPUTS["ModelBucketName"])
+    return next(
+        d["spec"]["template"]["metadata"]["annotations"]["qwenctl/compile-cache"]
+        for d in deployments
+        if d["metadata"]["labels"]["qwenctl/gpu-profile"] == profile
+    )
+
+
+def _annotated_pod(key, profile="g7e-1gpu", name=None):
+    metadata = {
+        "name": name or f"vllm-{profile}-5d8f7c9b6-x2k4q",
+        "labels": {"app": "qwen-vl", "qwenctl/gpu-profile": profile},
+        "annotations": {"qwenctl/compile-cache": key},
+    }
+    return {**READY_POD, "metadata": metadata}
+
+
+def _uploads(runner):
+    return [c["args"] for c in runner.calls if "put-object" in c["args"]]
+
+
+def test_fresh_compile_cache_is_uploaded_with_deployer_credentials(tmp_path):
+    key = _expected_key(tmp_path)
+    runner = FakeRunner(pods=[_annotated_pod(key)])
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    exec_call = next(c["args"] for c in runner.calls if "exec" in c["args"])
+    assert exec_call[exec_call.index("exec") + 1] == "vllm-g7e-1gpu-5d8f7c9b6-x2k4q" and "tar" in exec_call
+    (upload,) = _uploads(runner)
+    assert upload[upload.index("--bucket") + 1] == SERVING_OUTPUTS["ModelBucketName"]
+    assert upload[upload.index("--key") + 1] == key
+    # 条件写入，不覆盖已有缓存；带校验和
+    assert upload[upload.index("--if-none-match") + 1] == "*"
+    assert upload[upload.index("--checksum-algorithm") + 1] == "SHA256"
+    assert "已把编译缓存" in out.getvalue()
+    assert not os.path.exists(os.path.join(ctx.paths.root, "compile-cache.tar.gz"))  # 临时文件删掉
+
+
+def test_existing_compile_cache_is_not_overwritten(tmp_path):
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))], cached=True)
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _uploads(runner) == [] and not any("exec" in c["args"] for c in runner.calls)
+    assert "编译缓存已经在 S3 上" in out.getvalue()
+
+
+def test_compile_cache_failure_only_warns(tmp_path):
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))], capture_fails=True)
+    ctx, out = _ctx(tmp_path, runner)
+    state = run_install(ctx, resume=False)
+    assert state["completed"][-1] == "serving"
+    assert "保存编译缓存没有成功" in out.getvalue() and _uploads(runner) == []
+
+
+def test_oversized_compile_cache_is_not_uploaded(tmp_path, monkeypatch):
+    from qwenctl import compile_cache
+
+    monkeypatch.setattr(compile_cache, "MAX_ARCHIVE_BYTES", 4)
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))])
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _uploads(runner) == [] and "超过 4 字节" in out.getvalue()
+
+
+@pytest.mark.parametrize(
+    "pod",
+    [
+        # 篡改的 annotation：想借部署者的凭证覆盖模型权重
+        _annotated_pod("models/qwen3.5-35b-a3b-fp8/9d1823d2dee6/model-00001-of-00014.safetensors"),
+        # 还没滚动更新的旧 Pod（key 是旧配置算的）
+        _annotated_pod("compile-cache/g7e-1gpu/0000000000000000/vllm-cache.tar.gz"),
+        # 别的 profile 的 key 贴到这个 profile 的 Pod 上
+        _annotated_pod("compile-cache/g6-tp2/0000000000000000/vllm-cache.tar.gz"),
+        # 改了 label 想冒充别的 profile：profile 按 Pod 名（不可改）认
+        _annotated_pod("ignored", profile="g6-tp2", name="vllm-g7e-1gpu-5d8f7c9b6-x2k4q"),
+        # Pod 名对不上任何 profile：不是候选
+        _annotated_pod("k", name="vllm-x"),
+    ],
+)
+def test_capture_only_trusts_keys_computed_from_config(tmp_path, pod):
+    runner = FakeRunner(pods=[pod])
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _uploads(runner) == [] and not any("exec" in c["args"] for c in runner.calls)
+
+
+def test_label_cannot_redirect_capture_to_another_profiles_key(tmp_path):
+    """label 改成 g6-tp2、annotation 也换成 g6-tp2 的合法 key：Pod 名还是 g7e 的，不能存。"""
+    g6_key = _expected_key(tmp_path, "g6-tp2")
+    pod = _annotated_pod(g6_key, profile="g6-tp2", name="vllm-g7e-1gpu-5d8f7c9b6-x2k4q")
+    runner = FakeRunner(pods=[pod])
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _uploads(runner) == []
+
+
+def test_unclear_existence_still_saves_with_conditional_write(tmp_path):
+    """没有 s3:ListBucket 时 head-object 返回 403：照常保存，靠 If-None-Match 保证不覆盖已有缓存。"""
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))])
+    runner.head_error = "An error occurred (403) when calling the HeadObject operation: Forbidden"
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    (upload,) = _uploads(runner)
+    assert upload[upload.index("--if-none-match") + 1] == "*"
+    assert "用条件写入保存" in out.getvalue()
+
+
+def test_capture_tolerates_tar_reporting_changed_files(tmp_path):
+    """vLLM 还在写缓存时 tar 退出 1，压缩包本身完整（交给 check_archive 判断）。"""
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))])
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert runner.capture_ok_returncodes == (0, 1)
+
+
+def test_concurrent_writer_wins_without_error(tmp_path):
+    runner = FakeRunner(
+        pods=[_annotated_pod(_expected_key(tmp_path))],
+        put_error="An error occurred (PreconditionFailed) when calling the PutObject operation",
+    )
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert len(_uploads(runner)) == 1 and "刚被别的部署进程保存过" in out.getvalue()
+
+
+@pytest.mark.parametrize(
+    "members, reason",
+    [
+        ({"../escape.py": b"x"}, "指向缓存目录之外"),
+        ({"/etc/cron.d/x": b"x"}, "指向缓存目录之外"),
+    ],
+)
+def test_suspicious_archive_is_not_uploaded(tmp_path, members, reason):
+    runner = FakeRunner(pods=[_annotated_pod(_expected_key(tmp_path))], capture_bytes=_cache_archive(members))
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _uploads(runner) == [] and reason in out.getvalue()
+
+
+def test_every_profile_with_a_ready_pod_gets_its_cache_saved(tmp_path):
+    pods = [_annotated_pod(_expected_key(tmp_path, p), profile=p) for p in ("g7e-1gpu", "g6-tp2")]
+    runner = FakeRunner(pods=pods)
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    keys = sorted(u[u.index("--key") + 1] for u in _uploads(runner))
+    assert keys == sorted(_expected_key(tmp_path, p) for p in ("g7e-1gpu", "g6-tp2"))

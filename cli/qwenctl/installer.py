@@ -6,13 +6,16 @@ CloudShell 断线后运行 ./qwenctl deploy --resume，从第一个未完成的�
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from . import compile_cache
 from .addons import (
     KEDA_NAMESPACE,
     PROMETHEUS_NAMESPACE,
@@ -336,27 +339,32 @@ def _get_json(ctx: InstallContext, *args: str) -> Dict[str, Any]:
     return json.loads(result.stdout or "{}")
 
 
-def _already_synced(ctx: InstallContext, bucket: str) -> bool:
-    """S3 上有 _COMPLETE 标记就不用再起 Job（起 Job 要拉起 CPU 节点、拉 9 GB 镜像）。
-
-    标记在 revision 专属的前缀下，只有同步 Job 的角色能写（docs/03 §1.3）。同步脚本或镜像升级后
-    不会重新校验已完成的 revision；要强制重新同步，删掉这个标记即可。"""
-    key = model_prefix(ctx.config, ctx.versions) + "_COMPLETE"
+def _s3_exists(ctx: InstallContext, bucket: str, key: str) -> Tuple[bool, str]:
+    """(对象是否存在, 404 以外的错误信息)。没有 s3:ListBucket 权限时，S3 对不存在的对象返回 403 而不是 404。"""
     try:
         ctx.runner.run(
             ["aws", "s3api", "head-object", "--bucket", bucket, "--key", key, "--region", ctx.region],
             capture=True,
         )
     except CommandError as exc:
-        if "An error occurred (404)" not in exc.output:
-            # 403：没有 s3:ListBucket 权限时，S3 对不存在的对象也返回 403。照常起 Job（Job 自己会逐文件校验）
-            detail = exc.output.strip()[:200]
-            ctx.console.status(
-                "info",
-                f"没法确认 s3://{bucket}/{key} 是否存在（{detail}），照常运行同步 Job（已同步的文件会跳过）",
-            )
-        return False
-    return True
+        return False, "" if "An error occurred (404)" in exc.output else exc.output.strip()[:200]
+    return True, ""
+
+
+def _already_synced(ctx: InstallContext, bucket: str) -> bool:
+    """S3 上有 _COMPLETE 标记就不用再起 Job（起 Job 要拉起 CPU 节点、拉 9 GB 镜像）。
+
+    标记在 revision 专属的前缀下，只有同步 Job 的角色能写（docs/03 §1.3）。同步脚本或镜像升级后
+    不会重新校验已完成的 revision；要强制重新同步，删掉这个标记即可。"""
+    key = model_prefix(ctx.config, ctx.versions) + "_COMPLETE"
+    exists, detail = _s3_exists(ctx, bucket, key)
+    if detail:
+        # 照常起 Job（Job 自己会逐文件校验），但要让客户知道
+        ctx.console.status(
+            "info",
+            f"没法确认 s3://{bucket}/{key} 是否存在（{detail}），照常运行同步 Job（已同步的文件会跳过）",
+        )
+    return exists
 
 
 def _model_sync(ctx: InstallContext) -> None:
@@ -442,10 +450,13 @@ def _serving(ctx: InstallContext) -> None:
         ns,
         {d["metadata"]["name"]: d["spec"]["replicas"] for d in deployments if "replicas" in d["spec"]},
     )
-    _wait_for_serving(ctx, ns)
+    pods = _wait_for_serving(ctx, ns)
+    if pods:
+        _capture_compile_caches(ctx, ns, pods, _expected_cache_keys(deployments))
 
 
-def _wait_for_serving(ctx: InstallContext, ns: str) -> None:
+def _wait_for_serving(ctx: InstallContext, ns: str) -> List[Mapping[str, Any]]:
+    """等到有副本就绪，返回当时的 Pod 列表；超时返回空列表（只提示，不让部署失败）。"""
     started, last = _now(), ""
     while _now() - started < SERVING_TIMEOUT:
         pods = _get_json(ctx, "-n", ns, "get", "pods", "-l", "app=qwen-vl").get("items", [])
@@ -457,7 +468,7 @@ def _wait_for_serving(ctx: InstallContext, ns: str) -> None:
             last = summary
         if any(_pod_summary(p) == "Ready" for p in pods):
             ctx.console.status("ok", f"推理服务已就绪（{int(_now() - started)}s）")
-            return
+            return pods
         _sleep(POLL_INTERVAL)
     ctx.console.status(
         "warn",
@@ -466,6 +477,118 @@ def _wait_for_serving(ctx: InstallContext, ns: str) -> None:
     )
     ctx.console.line(f"      查看原因：kubectl -n {ns} get events --sort-by=.lastTimestamp | tail")
     ctx.console.line(f"      查看扩缩容：kubectl -n {ns} get scaledobject,hpa")
+    return []
+
+
+def _expected_cache_keys(deployments: Sequence[Mapping[str, Any]]) -> Dict[str, str]:
+    """按配置刚生成的 Deployment 里，每个 profile 的缓存 key。"""
+    return {
+        d["metadata"]["labels"]["qwenctl/gpu-profile"]: d["spec"]["template"]["metadata"]["annotations"][
+            compile_cache.ANNOTATION
+        ]
+        for d in deployments
+    }
+
+
+def _profile_of(pod_name: str, profiles: Iterable[str]) -> Optional[str]:
+    """按 Pod 名（vllm-<profile>-<ReplicaSet 哈希>-<后缀>，不可改）认 profile，不看可改的 label。"""
+    return next(
+        (p for p in profiles if re.fullmatch(f"vllm-{re.escape(p)}-[a-z0-9]+-[a-z0-9]+", pod_name)), None
+    )
+
+
+def _capture_compile_caches(
+    ctx: InstallContext, ns: str, pods: Sequence[Mapping[str, Any]], expected: Mapping[str, str]
+) -> None:
+    """每个 profile 取一个就绪的 Pod，把它冷编译出来的缓存存到 S3（回退 profile 有副本就绪时也一并保存）。
+
+    缓存里有生成的代码，这里是写入端的闸门（vLLM 的角色只读，见 compile_cache.py）：
+    key 只用按配置算出的值；Pod 上的 annotation 必须和它一致（否则是旧 Pod 或者被改过），不一致就不存。"""
+    chosen: Dict[str, Mapping[str, Any]] = {}
+    for pod in pods:
+        profile = _profile_of(pod["metadata"]["name"], expected)
+        if profile and profile not in chosen and _pod_summary(pod) == "Ready":
+            chosen[profile] = pod
+    for profile, pod in chosen.items():
+        name, key = pod["metadata"]["name"], expected[profile]
+        if (pod["metadata"].get("annotations") or {}).get(compile_cache.ANNOTATION) != key:
+            ctx.console.status("info", f"{name} 不是按当前配置启动的副本，这次不保存编译缓存")
+        elif _cache_missing(ctx, _model_bucket(ctx), key, profile):
+            _upload_compile_cache(ctx, ns, name, profile, key)
+
+
+def _cache_missing(ctx: InstallContext, bucket: str, key: str, profile: str) -> bool:
+    exists, detail = _s3_exists(ctx, bucket, key)
+    if exists:
+        ctx.console.status("ok", f"{profile}：编译缓存已经在 S3 上，新副本冷启动会跳过编译")
+    elif detail:  # 例如没有 s3:ListBucket 时的 403：照常保存，条件写入保证不会覆盖已有的缓存
+        ctx.console.status("info", f"{profile}：查不清楚编译缓存是否已存在（{detail}），用条件写入保存")
+    return not exists
+
+
+def _upload_compile_cache(ctx: InstallContext, ns: str, pod: str, profile: str, key: str) -> None:
+    """打包（流式写到私有临时文件）→ 检查压缩包 → 条件写入。失败只提示，不影响部署。"""
+    path = os.path.join(ctx.paths.root, "compile-cache.tar.gz")
+    try:
+        size = ctx.runner.run_to_file(
+            _kubectl(ctx, "-n", ns, *compile_cache.capture_command(pod)),
+            path,
+            compile_cache.MAX_ARCHIVE_BYTES,
+            compile_cache.CAPTURE_OK_RETURNCODES,
+        )
+        problem = compile_cache.check_archive(path)
+        if problem:
+            ctx.console.status("warn", f"{profile}：编译缓存没有通过检查（{problem}），没有保存")
+        elif _put_if_absent(ctx, _model_bucket(ctx), key, path):
+            ctx.console.status(
+                "ok", f"{profile}：已把编译缓存（{size / 1e6:.0f} MB）存到 S3，之后的冷启动省掉约 90 s 的编译"
+            )
+        else:
+            ctx.console.status("ok", f"{profile}：编译缓存刚被别的部署进程保存过，保留已有的那份")
+    except (CommandError, OSError) as exc:
+        ctx.console.status(
+            "warn",
+            f"{profile}：保存编译缓存没有成功（{_reason(exc)}）。不影响服务，之后的冷启动要多花约 90 s 编译",
+        )
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+
+
+def _reason(exc: BaseException) -> str:
+    if isinstance(exc, CommandError):
+        return exc.output.strip()[:200] or str(exc)
+    return str(exc)
+
+
+def _put_if_absent(ctx: InstallContext, bucket: str, key: str, path: str) -> bool:
+    """只在对象不存在时写入（S3 条件写）。返回是否由我们写入；别人先写了（412）返回 False。"""
+    try:
+        ctx.runner.run(
+            [
+                "aws",
+                "s3api",
+                "put-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--body",
+                path,
+                "--if-none-match",
+                "*",
+                "--checksum-algorithm",
+                "SHA256",
+                "--region",
+                ctx.region,
+            ],
+            capture=True,
+        )
+    except CommandError as exc:
+        if "PreconditionFailed" in exc.output or "(412)" in exc.output:
+            return False
+        raise
+    return True
 
 
 PHASES: Tuple[Phase, ...] = (

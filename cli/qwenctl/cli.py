@@ -304,8 +304,15 @@ def _validate_saved_names(config: Mapping[str, Any]) -> None:
     names = [
         serving.get(k) for k in ("namespace", "vllmServiceAccount", "syncServiceAccount") if k in serving
     ]
-    if not all(is_k8s_name(n) for n in names) or (
-        "modelPrefix" in serving and not _PREFIX.fullmatch(str(serving["modelPrefix"]))
+    prefixes = [str(serving[k]) for k in ("modelPrefix", "compileCachePrefix") if k in serving]
+    # 两个前缀不能互相包含：同步 Job 能写模型前缀，包含了缓存前缀就等于能往编译缓存里写代码
+    overlapping = len(prefixes) == 2 and (
+        prefixes[0].startswith(prefixes[1]) or prefixes[1].startswith(prefixes[0])
+    )
+    if (
+        not all(is_k8s_name(n) for n in names)
+        or not all(_PREFIX.fullmatch(p) for p in prefixes)
+        or overlapping
     ):
         raise ConfigError("保存的部署配置里 serving 的命名格式不对，请重新运行 ./qwenctl deploy")
     profiles = (config.get("gpu") or {}).get("profiles") or []

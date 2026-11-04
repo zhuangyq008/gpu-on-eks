@@ -118,6 +118,8 @@ SERVING_NAMESPACE = "qwen-vl"
 VLLM_SERVICE_ACCOUNT = "vllm"
 SYNC_SERVICE_ACCOUNT = "model-sync"
 MODEL_PREFIX = "models/"
+# vLLM 编译缓存（torch.compile / Triton 产物）。vLLM 只读，由 qwenctl 写入（见 compile_cache.py）
+COMPILE_CACHE_PREFIX = "compile-cache/"
 
 
 def serving_section() -> Dict[str, Any]:
@@ -126,6 +128,7 @@ def serving_section() -> Dict[str, Any]:
         "vllmServiceAccount": VLLM_SERVICE_ACCOUNT,
         "syncServiceAccount": SYNC_SERVICE_ACCOUNT,
         "modelPrefix": MODEL_PREFIX,
+        "compileCachePrefix": COMPILE_CACHE_PREFIX,
     }
 
 

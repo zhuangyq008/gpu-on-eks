@@ -92,7 +92,8 @@
     "namespace": "qwen-vl",
     "vllmServiceAccount": "vllm",
     "syncServiceAccount": "model-sync",
-    "modelPrefix": "models/"
+    "modelPrefix": "models/",
+    "compileCachePrefix": "compile-cache/"
   },
   "advanced": {
     "serving": {
