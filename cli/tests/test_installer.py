@@ -122,7 +122,10 @@ def test_full_install_runs_every_phase_in_order(tmp_path):
     assert state["completed"] == [key for key, _, _ in PHASES]
     cmds = runner.commands()
     assert cmds[0] == "npm ci --omit=dev --ignore-scripts --no-audit --no-fund"
-    assert cmds[1].endswith("cdk bootstrap aws://123456789012/ap-southeast-5")
+    bootstrap = runner.calls[1]["args"]
+    assert bootstrap[1:3] == ["bootstrap", "aws://123456789012/ap-southeast-5"]
+    # cdk 在 infra/ 下会先执行 app，app 必须拿到部署配置（真实部署时踩到过）
+    assert f"configFile={ctx.config_path}" in bootstrap
     deploy = runner.calls[2]["args"]
     assert deploy[1:4] == ["deploy", "--all", "--require-approval"]
     assert f"configFile={ctx.config_path}" in deploy
@@ -213,7 +216,7 @@ def test_qualifier_is_passed_to_bootstrap_and_deploy(tmp_path):
     ctx, _ = _ctx(tmp_path, runner, config=config)
     run_install(ctx, resume=False)
     cmds = runner.commands()
-    assert cmds[1].endswith("--qualifier custqual")
+    assert "--qualifier custqual" in cmds[1]
     assert "@aws-cdk/core:bootstrapQualifier=custqual" in cmds[2]
 
 

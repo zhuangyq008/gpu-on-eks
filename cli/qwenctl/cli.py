@@ -220,7 +220,7 @@ def _deploy(
     for line in summary_lines(config, report):
         con.line(line)
     if not args.plan:
-        con.line("  确认后会在这个账号里创建上面的资源（CloudFormation + Helm），首次约 40 分钟")
+        con.line("  确认后会在这个账号里创建上面的资源（CloudFormation + Helm），首次约 20 分钟")
     if not con.ask_bool("继续？", True):
         raise Aborted("已取消")
     path = save_config(config, args.output or DeploymentPaths.for_name(report.name).config)

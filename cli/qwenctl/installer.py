@@ -77,7 +77,12 @@ def _cdk_bootstrap(ctx: InstallContext) -> None:
         ctx.console.status("ok", "CDK 已经 bootstrap，跳过")
         return
     qualifier = ["--qualifier", ctx.qualifier] if ctx.qualifier else []
-    ctx.runner.run([ctx.cdk, "bootstrap", f"aws://{ctx.account}/{ctx.region}", *qualifier], cwd=ctx.infra_dir)
+    # 在 infra/ 下运行时 cdk 会先执行 cdk.json 里的 app，app 需要部署配置
+    ctx.runner.run(
+        [ctx.cdk, "bootstrap", f"aws://{ctx.account}/{ctx.region}", *qualifier]
+        + ["-c", f"configFile={ctx.config_path}", *_qualifier_args(ctx)],
+        cwd=ctx.infra_dir,
+    )
 
 
 def _cdk_deploy(ctx: InstallContext) -> None:
@@ -233,7 +238,7 @@ def _verify(ctx: InstallContext) -> None:
 PHASES: Tuple[Phase, ...] = (
     ("cdk-deps", "准备 CDK（依赖和编译）", _cdk_deps),
     ("cdk-bootstrap", "CDK bootstrap（只有首次需要）", _cdk_bootstrap),
-    ("cdk-deploy", "部署 AWS 资源：网络、EKS（CloudFormation，首次约 25~35 分钟）", _cdk_deploy),
+    ("cdk-deploy", "部署 AWS 资源：网络、EKS（CloudFormation，首次约 15 分钟）", _cdk_deploy),
     ("kubeconfig", "配置 kubectl", _kubeconfig),
     ("karpenter", "安装 Karpenter", _karpenter),
     ("nodepools", "创建节点池：通用 CPU（非 GPU 业务）+ GPU", _nodepools),

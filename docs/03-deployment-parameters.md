@@ -93,7 +93,7 @@ $ ./qwenctl deploy
   3. 副本数      最少 [2]  最多 [4]   常驻 ≈ $4,910/月，峰值 ≈ $13.5/h  >
   4. 可选能力    [x] 异步通道  [ ] Bedrock 溢出   告警邮箱 []           >
 [3/3] 确认
-  （汇总表）首次部署约 40 分钟
+  （汇总表）首次部署约 20 分钟
   继续？[Y/n]
 → 开始分阶段安装（cdk-deploy → karpenter → nodepools …）；断线后运行 ./qwenctl deploy --resume
 ```
@@ -291,8 +291,50 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | 部署配置契约（Python → CDK） | ✅ zod 校验 + 契约测试 | `cli/qwenctl/models.py`、`infra/lib/config.ts`、`infra/test/contract.test.ts` |
 | CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ synth 通过，未部署 | `infra/lib/network-stack.ts` |
 | CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ synth 通过，未部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
-| 客户端安装流程（7 个阶段、断点续跑、锁定版本工具） | ✅ 单元测试通过；kubectl/helm 下载校验和 chart 拉取已实测；**还没有在真实集群上跑过** | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
+| 客户端安装流程（7 个阶段、断点续跑、锁定版本工具） | ✅ **已在 ap-southeast-5 真实部署验证**（见 §9.1） | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
 | KEDA、网关、可观测性栈、权重同步、镜像快照、编译缓存、vLLM | ⏳ | — |
 | `status` / `test` / `scale` / `destroy` 等命令 | ⏳ | — |
 
 测试：Python 221 个（3.9 和 3.12 都跑，覆盖率 98%）；CDK 45 个。部署前的安全评审（2026-11-03）：没有 CRITICAL/HIGH，5 个 MEDIUM 和 5 个 LOW 已全部修复。
+
+### 9.1 端到端验证（2026-11-03，ap-southeast-5，`./qwenctl deploy --yes --approve`）
+
+| 阶段 | 结果 | 耗时 |
+|---|---|---|
+| cdk bootstrap | ✅（第一次失败：`cdk bootstrap` 在 `infra/` 下会先执行 app，没传部署配置；修复后用 `--resume` 续跑成功） | ~1 分钟 |
+| 网络栈 | ✅ VPC、2 AZ 子网、NAT、S3 网关 + 5 个接口终端节点、Flow Logs | ~3 分钟 |
+| EKS 栈 | ✅ 集群 1.36、2 × m7g.large Bottlerocket 系统节点（IMDSv2 hop 1、EBS 加密已核实）、5 个 add-on 全部 ACTIVE | ~11 分钟 |
+| Karpenter + 节点池 | ✅ chart sha256 校验通过；2 个控制器副本分布在两个 AZ；EC2NodeClass general/gpu 都 Ready；3 个 NodePool Ready | ~2 分钟 |
+| **合计** | | **~17 分钟** |
+
+**非 GPU 业务（通用节点池）**：部署 2 个 nginx 副本（不带任何 nodeSelector / toleration）
+- 扩容：**37 秒**从 apply 到 Pod Ready。Karpenter 启动 c7i-flex.large（x86、按需、apse5-az2），09:18:51 创建 → 09:18:54 启动 → 09:19:03 注册 → 09:19:21 就绪
+- 缩容：删除业务后 **130 秒**节点被回收（空闲 1 分钟 + 驱逐和终止）
+
+**GPU 节点（GPU 节点上限 2 台：g7e 节点池上限 1 GPU、g6 节点池上限 4 GPU）**
+- **g7e.2xlarge 没货**：apse5-az2 连续 4 次 `InsufficientInstanceCapacity`（09:41~09:52）。马来西亚 g7e 只在这一个 AZ，没有地方可换
+- **回退生效**：不指定机型的 GPU Pod → Karpenter 跳过 g7e，按 weight 选 g6-tp2 → 09:52:39 启动 g6.12xlarge（apse5-az1）→ **46 秒**从 Pod 创建到 Running
+- 驱动：Bottlerocket 1.68.1 NVIDIA 变体 = **580.178.04 / CUDA 13.0**，L4 正常识别。R580 官方支持 Blackwell，g7e 大概率可用，**但还没有在 g7e 实机上验证**
+
+**vLLM 冷启动基线（未优化：镜像直接从 Docker Hub，权重直接从 HF；g6.12xlarge TP=2，节点已就绪）**
+
+| 阶段（01 §4.1 / 02 §2.1） | 耗时 | 说明 |
+|---|---|---|
+| H 镜像拉取 | 91 s | `vllm/vllm-openai:v0.32.0`，9.2 GB |
+| J 进程启动、NCCL 初始化 | ~58 s | |
+| K 权重：下载 + 加载 | 137 s + 12 s | HF 下载约 270 MB/s；加载每卡 17.13 GiB |
+| L 编译 | 31.5 s | torch.compile（缓存未命中） |
+| M Engine 初始化 | 126 s（含编译） | CUDA graph 11 s；KV cache 每卡 1.29 GiB = 74,898 token，8K 上下文下最大并发 9.1 |
+| **Pod 创建 → Ready** | **7 分 17 秒** | 加上新节点启动（约 40 s）≈ 8 分钟；目标 ≤ 3 分钟 |
+
+可优化的空间（对应 01 §4）：权重放 S3 + Run:ai Streamer 可省掉约 2 分 20 秒的下载；EBS 快照预缓存镜像可省掉约 1.5 分钟；编译缓存放 S3 可省掉约 30 秒。
+
+**推理测试**（`max-model-len=8192`，`gpu-memory-utilization=0.92`，关闭 thinking）
+
+| 测试 | 结果 |
+|---|---|
+| 纯文本 | 0.55 s |
+| 设备铭牌图片 → JSON（7 个字段） | 2.14 s，全部识别正确（型号、序列号、功率、电压、频率、PASS） |
+| 8 路并发（每路 1 张图 + 128 token） | TTFT p50 0.47 s / max 0.64 s，墙钟 3.3 s，输出 311 tok/s |
+
+结论：g6.12xlarge TP=2 作为回退 profile 可用，KV 余量比预估的好（8K 上下文 9 路并发）。

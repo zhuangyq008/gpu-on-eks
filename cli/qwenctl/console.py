@@ -37,6 +37,8 @@ class Console:
     # ---- 输出 ----
     def line(self, text: str = "") -> None:
         self._out.write(text + "\n")
+        # 输出重定向到文件时 Python 会缓冲，和子进程（cdk/helm）的输出顺序会乱
+        self._out.flush()
 
     def status(self, status: str, text: str, detail: str = "") -> None:
         self.line(f"  {SYMBOLS.get(status, '-')} {text}")
