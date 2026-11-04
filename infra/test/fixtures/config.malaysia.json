@@ -95,6 +95,15 @@
     "modelPrefix": "models/",
     "compileCachePrefix": "compile-cache/"
   },
+  "addons": {
+    "ingress": {
+      "enabled": true
+    },
+    "externalDns": {
+      "enabled": false,
+      "hostedZones": []
+    }
+  },
   "advanced": {
     "serving": {
       "max_model_len": 32768,

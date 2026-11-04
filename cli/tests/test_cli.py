@@ -56,7 +56,7 @@ def test_deploy_with_defaults_writes_config(gw, tmp_path):
 
 def test_deploy_cancel_at_confirmation_writes_nothing(gw, tmp_path):
     target = tmp_path / "qwen-vl.json"
-    con, out = make_console(["1", "1", "", "", "", "", "n"])
+    con, out = make_console(["1", "1", "", "", "", "", "", "n"])
     code = main(["deploy", "--output", str(target)], _factory(gw), con)
     assert code == EXIT_ABORTED
     assert not target.exists()
@@ -111,7 +111,7 @@ def test_confirmation_page_shows_endpoint_plan(gw, tmp_path):
 
 def test_existing_vpc_config_carries_subnets_and_s3_plan(gw, tmp_path):
     target = tmp_path / "c.json"
-    con, out = make_console(["2", "1", "1", "", "", "", "", "y"])
+    con, out = make_console(["2", "1", "1", "", "", "", "", "", "y"])
     assert main(["deploy", "--plan", "--output", str(target)], _factory(gw), con) == EXIT_OK
     network = json.loads(target.read_text(encoding="utf-8"))["network"]
     assert [s["zoneId"] for s in network["privateSubnets"]] == ["apse5-az1", "apse5-az2"]
@@ -152,7 +152,7 @@ def test_name_with_trailing_newline_is_rejected(gw):
 def test_interactive_deploy_runs_install_with_saved_config(gw, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     install = RecordingInstall()
-    con, out = make_console(["1", "1", "", "", "", "", "y", "y"])
+    con, out = make_console(["1", "1", "", "", "", "", "", "y", "y"])
     stacks = {"CDKToolkit": "CREATE_COMPLETE"}
     assert main(["deploy"], _factory(replace(gw, stacks=stacks)), con, install) == EXIT_OK
     (request,) = install.requests
@@ -165,7 +165,7 @@ def test_interactive_deploy_runs_install_with_saved_config(gw, tmp_path, monkeyp
 def test_bootstrap_needs_consent(gw, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     install = RecordingInstall()
-    con, out = make_console(["1", "1", "", "", "", "", "y", "n"])
+    con, out = make_console(["1", "1", "", "", "", "", "", "y", "n"])
     assert main(["deploy"], _factory(gw), con, install) == EXIT_ABORTED
     assert install.requests == []
     assert "cdk bootstrap" in out.getvalue()
@@ -177,15 +177,19 @@ def test_yes_without_approve_only_saves_config(gw, tmp_path, monkeypatch):
     con, _ = make_console(assume_defaults=True)
     assert main(["deploy", "--yes"], _factory(gw), con, install) == EXIT_OK
     assert install.requests == []
-    con, _ = make_console(assume_defaults=True)
-    assert main(["deploy", "--yes", "--approve"], _factory(gw), con, install) == EXIT_OK
+    # 配置已经保存：再次提问会覆盖它，所以被拒绝；部署保存的配置用 --resume
+    con, out = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes", "--approve"], _factory(gw), con, install) == EXIT_CONFIG_ERROR
+    assert "--resume" in out.getvalue() and install.requests == []
+    con, _ = make_console()
+    assert main(["deploy", "--resume"], _factory(gw), con, install) == EXIT_OK
     assert len(install.requests) == 1
 
 
 def test_plan_never_installs(gw, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     install = RecordingInstall()
-    con, out = make_console(["1", "1", "", "", "", "", "y"])
+    con, out = make_console(["1", "1", "", "", "", "", "", "y"])
     assert main(["deploy", "--plan"], _factory(gw), con, install) == EXIT_OK
     assert install.requests == []
     assert "确认后会在这个账号里创建" not in out.getvalue()

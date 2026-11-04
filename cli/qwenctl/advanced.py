@@ -147,6 +147,11 @@ def _validate_enum(here: Path, dotted: str, value: Any) -> None:
 
 
 _IAM_ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]+$")
+# 只接受 key ARN：alias 不能用于 KMS grant（EBS 卷）和 EKS Secret 加密
+_KMS_KEY_ARN = re.compile(
+    r"^arn:aws[a-z-]*:kms:[a-z]{2}(-[a-z]+)+-\d:\d{12}:key/"
+    r"(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"  # 和 infra/lib/config.ts 一致
+)
 C_SLA_RANGE = (1, 1024)
 
 
@@ -174,6 +179,11 @@ def _validate_special(here: Path, dotted: str, value: Any) -> None:
             raise ConfigError(
                 f"{dotted} 的 key 是 GPU profile 名，value 是 {C_SLA_RANGE[0]}~{C_SLA_RANGE[1]} 的整数"
                 f"（单副本在 SLA 内的并发）：{bad}"
+            )
+    elif here == ("compliance", "kms_key_arn") and value is not None:
+        if not _KMS_KEY_ARN.fullmatch(value):
+            raise ConfigError(
+                f"{dotted} 必须是 KMS key 的 ARN（arn:aws:kms:<region>:<账号>:key/<id>），不能是别名：{value}"
             )
     elif here == ("network", "cidr"):
         try:

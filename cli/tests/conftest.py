@@ -10,7 +10,14 @@ import pytest
 
 from qwenctl.az_select import Zone
 from qwenctl.console import Console
-from qwenctl.gateway import CapacityReservation, Certificate, EndpointServices, GatewayError, VpcDns
+from qwenctl.gateway import (
+    CapacityReservation,
+    Certificate,
+    EndpointServices,
+    GatewayError,
+    HostedZone,
+    VpcDns,
+)
 from qwenctl.network import RouteTable, Subnet, Vpc
 
 MY_ZONES = (
@@ -80,6 +87,8 @@ class FakeGateway:
     endpoints: EndpointServices = DEFAULT_ENDPOINTS
     service_zones: Optional[Dict[str, FrozenSet[str]]] = field(default_factory=lambda: dict(SERVICE_ZONES))
     certs: Tuple[Certificate, ...] = ()
+    hosted_zones: Tuple[HostedZone, ...] = ()
+    hosted_zones_error: bool = False
     vpc_error: bool = False
 
     def region(self) -> str:
@@ -154,6 +163,11 @@ class FakeGateway:
     def issued_certificates(self) -> Sequence[Certificate]:
         return self.certs
 
+    def public_hosted_zones(self) -> Sequence[HostedZone]:
+        if self.hosted_zones_error:
+            raise GatewayError("AccessDenied: route53:ListHostedZones")
+        return self.hosted_zones
+
 
 class ScriptedInput:
     """按顺序返回预设的输入；用完后抛 EOFError，避免测试死循环。"""
@@ -203,3 +217,9 @@ class RecordingInstall:
         self.requests.append(request)
         if self._error:
             raise self._error
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """测试不能读写开发机上真实的 ~/.qwenctl（里面可能是正在运行的部署的配置）。"""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))

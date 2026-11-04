@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import traceback
 from dataclasses import dataclass
@@ -18,10 +19,10 @@ from .endpoints import plan_endpoints, wanted_interface_endpoints
 from .gateway import AwsGateway, GatewayError
 from .installer import InstallError
 from .models import DeploymentConfig, migrate_config
-from .names import is_k8s_name
+from .names import is_hosted_zone, is_k8s_name
 from .paths import DeploymentPaths, write_private
 from .preflight import PreflightReport, pick_system_instance_type, run_preflight
-from .questions import ask_all
+from .questions import MAX_DNS_ZONES, ask_all
 from .render import show_preflight, summary_lines
 from .store import save_config
 from .toolchain import ToolError
@@ -202,6 +203,19 @@ def _deploy(
     args: argparse.Namespace,
     install: InstallFn,
 ) -> int:
+    saved = os.path.isfile(DeploymentPaths.for_name(report.name).config)
+    if (report.existing_deployment or saved) and not (args.plan and args.output):
+        where = (
+            "账号里已经有这个部署的 CloudFormation 栈"
+            if report.existing_deployment
+            else "本机已经保存了它的配置"
+        )
+        raise ConfigError(
+            f"名为 {report.name} 的部署已经存在（{where}）。用保存的配置部署或继续请运行 ./qwenctl deploy --resume，"
+            f"重新执行所有阶段用 --update；要改参数，改 ~/.qwenctl/{report.name}/config.json 后再 --update。"
+            "重新提问会覆盖保存的配置，所以这里不再继续（只想看看新的配置，可以加 --plan --output <另一个路径>；"
+            "确实要从头来，先删掉保存的配置）"
+        )
     answers, selection = ask_all(con, report, gw, advanced)
     system_type = pick_system_instance_type(selection, report.offerings)
     if system_type is None:
@@ -243,7 +257,7 @@ def _deploy(
     _confirm_bootstrap(con, report, args.approve)
     request = _request(con, report.name, report.region, report.account, config.to_dict(), path)
     install(InstallRequest(**{**request.__dict__, "cdk_bootstrapped": report.cdk_bootstrapped}))
-    _print_done(con, report.name)
+    _print_done(con, report.name, config.to_dict())
     return EXIT_OK
 
 
@@ -280,7 +294,7 @@ def _resume(con: Console, gw: AwsGateway, args: argparse.Namespace, install: Ins
     install(
         InstallRequest(**{**request.__dict__, "cdk_bootstrapped": bootstrapped, "resume": not args.update})
     )
-    _print_done(con, config["name"])
+    _print_done(con, config["name"], migrated)
     return EXIT_OK
 
 
@@ -339,6 +353,31 @@ def _validate_saved_gpu_numbers(gpu: Mapping[str, Any]) -> None:
         raise ConfigError("保存的部署配置里 GPU 副本数或 profile 参数不对，请重新运行 ./qwenctl deploy")
 
 
+def _validate_saved_addons(addons: Any) -> None:
+    """集群插件的选择会进入 CloudFormation（IAM 权限范围）和 Helm values。旧配置没有这一节，由迁移补上。"""
+    if addons is None:
+        return
+    try:
+        ingress = addons["ingress"]["enabled"]
+        dns = addons["externalDns"]
+        zones = dns["hostedZones"]
+        ok = (
+            isinstance(ingress, bool)
+            and isinstance(dns["enabled"], bool)
+            and isinstance(zones, list)
+            and len(zones) <= MAX_DNS_ZONES
+            and all(isinstance(z, Mapping) and is_hosted_zone(z.get("id"), z.get("name")) for z in zones)
+            and len({z["id"] for z in zones}) == len(zones)
+            and (not dns["enabled"] or (ingress and bool(zones)))
+        )
+    except (KeyError, TypeError):
+        ok = False
+    if not ok:
+        raise ConfigError(
+            "保存的部署配置里 addons 不对：ExternalDNS 需要先启用 Web 应用入口，并且至少选一个合法的托管区域"
+        )
+
+
 def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
     """保存的配置会进入 aws/cdk 命令行和本地路径：继续之前重新校验，并确认没有换账号或 region。"""
     try:
@@ -350,6 +389,7 @@ def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
         raise ConfigError("保存的部署配置里账号或 region 格式不对，请重新运行 ./qwenctl deploy")
     _validate_saved_names(config)
     _validate_saved_gpu_numbers(config.get("gpu") or {})
+    _validate_saved_addons(config.get("addons"))
     caller_account, _ = gw.caller_identity()
     if caller_account != account or gw.region() != region:
         raise ConfigError(
@@ -366,7 +406,7 @@ def _request(
     )
 
 
-def _print_done(con: Console, name: str) -> None:
+def _print_done(con: Console, name: str, config: Mapping[str, Any]) -> None:
     paths = DeploymentPaths.for_name(name)
     con.line()
     con.status("ok", f"部署完成：{name}")
@@ -374,3 +414,9 @@ def _print_done(con: Console, name: str) -> None:
     con.line(
         "      客户的非 GPU 业务直接 kubectl apply 即可，会调度到通用 CPU 节点池（Karpenter 按需扩出节点）"
     )
+    con.line("      持久卷：默认 StorageClass 是加密的 gp3；HPA 可以按 CPU / 内存扩缩容（metrics-server）")
+    if (config.get("addons") or {}).get("ingress", {}).get("enabled"):
+        con.line(
+            "      Web 应用入口：Ingress 用 ingressClassName: alb；公网 ALB 请挂 WAF（ARN 见上面的提示），"
+            "用法见 docs/04 §5.8"
+        )

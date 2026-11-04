@@ -17,10 +17,16 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from . import compile_cache
 from .addons import (
+    ADMISSION_POLICIES,
     KEDA_NAMESPACE,
+    LBC_NAMESPACE,
+    LBC_RELEASE,
     PROMETHEUS_NAMESPACE,
     PROMETHEUS_RELEASE,
+    admission_policies,
+    gp3_storage_class,
     keda_values,
+    load_balancer_controller_values,
     namespace_manifest,
     prometheus_values,
 )
@@ -268,6 +274,86 @@ def _metrics(ctx: InstallContext) -> None:
 def _keda(ctx: InstallContext) -> None:
     _apply(ctx, [namespace_manifest(KEDA_NAMESPACE)])
     _helm(ctx, "keda", "keda", _helm_values(ctx, "keda", keda_values()), namespace=KEDA_NAMESPACE)
+
+
+def _cluster_addons(ctx: InstallContext) -> None:
+    """客户 Web 应用用到的插件：加密的 gp3 默认 StorageClass；选了 Web 应用入口时装 AWS Load Balancer Controller。
+
+    metrics-server、EBS CSI 驱动、ExternalDNS 是 EKS 托管 add-on，已经在 cdk-deploy 阶段装好。"""
+    _apply(ctx, [gp3_storage_class(ctx.config["advanced"]["compliance"].get("kms_key_arn"))])
+    _unset_legacy_default_storage(ctx)
+    if not (ctx.config.get("addons") or {}).get("ingress", {}).get("enabled"):
+        # 之前启用过、后来关掉：护栏的提示会让人去写已经不存在的控制器的 class，一起删掉
+        ctx.runner.run(
+            _kubectl(
+                ctx,
+                "delete",
+                "validatingadmissionpolicybinding,validatingadmissionpolicy",
+                *ADMISSION_POLICIES,
+                "--ignore-not-found",
+            ),
+            capture=True,
+        )
+        _warn_if_controller_left_behind(ctx)
+        ctx.console.status("info", "没有选 Web 应用入口，跳过 AWS Load Balancer Controller")
+        return
+    outputs = eks_outputs(ctx)
+    vpc_id = outputs.get("VpcId")
+    if not vpc_id:
+        raise InstallError("addons", "EKS 栈的输出里没有 VpcId，请先完成 CloudFormation 部署")
+    protected = (ctx.config["serving"]["namespace"],)
+    values = load_balancer_controller_values(ctx.name, ctx.region, vpc_id, protected)
+    _helm(ctx, LBC_RELEASE, LBC_RELEASE, _helm_values(ctx, LBC_RELEASE, values), namespace=LBC_NAMESPACE)
+    _apply(ctx, admission_policies(ctx.region, ctx.account, protected))
+    waf = outputs.get("WebAclArn")
+    if waf:
+        ctx.console.status("ok", "公网 ALB 请在 Ingress 上加注解挂 WAF：")
+        ctx.console.line(f"      alb.ingress.kubernetes.io/wafv2-acl-arn: {waf}")
+
+
+def _warn_if_controller_left_behind(ctx: InstallContext) -> None:
+    """关掉 Web 应用入口时，控制器的 IAM 角色已经在 cdk-deploy 阶段删掉了。这里不自动卸载控制器：
+    还有 Ingress / NLB 的话，卸载后它们的负载均衡器会遗留下来继续计费，要按 docs/04 §5.8 的顺序人工处理。"""
+    result = ctx.runner.run(
+        [
+            ctx.tools["helm"],
+            "list",
+            "--namespace",
+            LBC_NAMESPACE,
+            "--short",
+            "--filter",
+            f"^{LBC_RELEASE}$",
+            "--kubeconfig",
+            ctx.paths.kubeconfig,
+        ],
+        capture=True,
+    )
+    if result.stdout.strip():
+        ctx.console.status(
+            "warn",
+            f"集群里还装着 {LBC_RELEASE}，但它的 IAM 角色已经删除",
+            "请按 docs/04 §5.8「关掉」的顺序处理：先删 Ingress 和 NLB Service，确认负载均衡器删干净，再 helm uninstall",
+        )
+
+
+def _unset_legacy_default_storage(ctx: InstallContext) -> None:
+    """EKS 标准集群可能自带一个 gp2 StorageClass（in-tree、不加密）。两个默认并存时，没写 storageClassName 的
+    PVC 会用最新创建的那个；显式取消 gp2 的默认标记，不依赖创建顺序。"""
+    try:
+        ctx.runner.run(
+            _kubectl(
+                ctx,
+                "annotate",
+                "storageclass",
+                "gp2",
+                "storageclass.kubernetes.io/is-default-class=false",
+                "--overwrite",
+            ),
+            capture=True,
+        )
+    except CommandError as exc:
+        if "NotFound" not in exc.output and "not found" not in exc.output:
+            raise
 
 
 def _karpenter(ctx: InstallContext) -> None:
@@ -601,6 +687,7 @@ PHASES: Tuple[Phase, ...] = (
     ("verify", "检查集群状态", _verify),
     ("metrics", "安装集群内 Prometheus（给 KEDA 做扩缩容查询）", _metrics),
     ("keda", "安装 KEDA", _keda),
+    ("addons", "安装集群插件：默认存储（gp3）、Web 应用入口（按部署时的选择）", _cluster_addons),
     ("model-sync", "同步模型权重到 S3（首次约 5 分钟）", _model_sync),
     ("serving", "部署 vLLM 推理服务（首次约 5~8 分钟）", _serving),
 )

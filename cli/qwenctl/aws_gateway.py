@@ -17,7 +17,7 @@ from botocore.exceptions import (
 
 from .az_select import Zone
 from .catalog import is_gpu_family, is_standard_family
-from .gateway import CapacityReservation, Certificate, EndpointServices, GatewayError, VpcDns
+from .gateway import CapacityReservation, Certificate, EndpointServices, GatewayError, HostedZone, VpcDns
 from .network import RouteTable, Subnet, Vpc
 
 _CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"}, connect_timeout=5, read_timeout=20)
@@ -378,6 +378,17 @@ class Boto3Gateway:
             ),
         )
         return tuple(Certificate(arn=c["CertificateArn"], domain=c["DomainName"]) for c in items)
+
+    def public_hosted_zones(self) -> Sequence[HostedZone]:
+        items = self._call(
+            "无法列出 Route 53 托管区域",
+            lambda: self._paginate("route53", "list_hosted_zones", "HostedZones"),
+        )
+        return tuple(
+            HostedZone(zone_id=z["Id"].split("/")[-1], name=z["Name"].rstrip("."))
+            for z in items
+            if not (z.get("Config") or {}).get("PrivateZone")
+        )
 
 
 def _name_tag(tags: Iterable[Dict[str, str]]) -> str:

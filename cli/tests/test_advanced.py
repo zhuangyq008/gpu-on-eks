@@ -44,6 +44,11 @@ def test_deep_merge_does_not_mutate_inputs():
         ({"compliance": {"tags": {"Owner": 1}}}, "key 和 value 都必须是字符串"),
         ({"compliance": {"extra_admin_role_arns": ["arn:aws:iam::123:user/x"]}}, "不是 IAM 角色 ARN"),
         ({"scaling": {"waiting_threshold": 0}}, "1~1000"),
+        (
+            {"compliance": {"kms_key_arn": "arn:aws:kms:ap-southeast-5:123456789012:alias/my-key"}},
+            "不能是别名",
+        ),
+        ({"compliance": {"kms_key_arn": "not-an-arn"}}, "KMS key 的 ARN"),
         ({"scaling": {"waiting_threshold": float("nan")}}, "1~1000"),
         ({"scaling": {"c_sla": {"g7e.2xlarge": 32}}}, "key 是 GPU profile 名"),
         ({"scaling": {"c_sla": {"g7e-1gpu": "40"}}}, "1~1024 的整数"),
@@ -62,7 +67,7 @@ def test_validate_accepts_freeform_and_nullable():
             "scaling": {"c_sla": {"g7e-1gpu": 32}, "schedule": {"timezone": "Asia/Kuala_Lumpur"}},
             "compliance": {
                 "tags": {"CostCenter": "mfg"},
-                "kms_key_arn": "arn:aws:kms:...",
+                "kms_key_arn": "arn:aws:kms:ap-southeast-5:123456789012:key/11111111-2222-3333-4444-555555555555",
                 "extra_admin_role_arns": ["arn:aws:iam::123456789012:role/ops/PlatformAdmin"],
             },
             "general_nodes": {"arch": ["amd64", "arm64"], "cpu_limit": 64},

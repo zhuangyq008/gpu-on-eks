@@ -57,7 +57,7 @@ describe('EKS 栈', () => {
     });
   });
 
-  test('核心 add-on 版本锁定；DaemonSet 类在节点组之前，其余在节点组之后', () => {
+  test('全部 add-on 版本锁定；DaemonSet 类在节点组之前，其余在节点组之后', () => {
     const addons = template.findResources('AWS::EKS::Addon');
     const byName = Object.fromEntries(
       Object.values(addons).map((r) => {
@@ -66,7 +66,15 @@ describe('EKS 栈', () => {
       }),
     );
     expect(Object.keys(byName).sort()).toEqual(
-      ['coredns', 'eks-node-monitoring-agent', 'eks-pod-identity-agent', 'kube-proxy', 'vpc-cni'].sort(),
+      [
+        'aws-ebs-csi-driver',
+        'coredns',
+        'eks-node-monitoring-agent',
+        'eks-pod-identity-agent',
+        'kube-proxy',
+        'metrics-server',
+        'vpc-cni',
+      ].sort(),
     );
     for (const [name, res] of Object.entries(byName)) {
       expect(res.Properties.AddonVersion).toBe(VERSIONS.eksAddons[name]);
@@ -105,7 +113,9 @@ describe('EKS 栈', () => {
   });
 
   test('Karpenter 控制器的 6 份策略都按集群名限定范围', () => {
-    const policies = Object.values(template.findResources('AWS::IAM::ManagedPolicy'));
+    const policies = Object.values(template.findResources('AWS::IAM::ManagedPolicy')).filter((p) =>
+      String((p as { Properties: { Description?: string } }).Properties.Description).startsWith('Karpenter controller'),
+    );
     expect(policies).toHaveLength(6);
     const text = JSON.stringify(policies);
     expect(text).toContain('aws:ResourceTag/kubernetes.io/cluster/qwen-vl');
@@ -138,6 +148,8 @@ describe('EKS 栈', () => {
       'KarpenterNodeRoleName',
       'KarpenterInterruptionQueueName',
       'PrivateSubnetIds',
+      'VpcId',
+      'WebAclArn',
     ]) {
       template.hasOutput(key, {});
     }
@@ -196,5 +208,21 @@ describe('EKS 栈可选项', () => {
     const broken = { ...VERSIONS, eksAddons: { ...VERSIONS.eksAddons, coredns: '' } };
     delete (broken.eksAddons as Record<string, string>).coredns;
     expect(() => buildStacks(new cdk.App(), fixture(), broken)).toThrow(/缺少 EKS add-on coredns/);
+  });
+
+  test('VpcId 输出：现有 VPC 时就是配置里的 vpcId（qwenctl 装 Load Balancer Controller 用）', () => {
+    const existing = withOverrides(fixture(), {
+      network: {
+        mode: 'existing',
+        cidr: '10.0.0.0/16',
+        vpcId: 'vpc-0abc1234',
+        privateSubnets: [
+          { subnetId: 'subnet-0aaa1111', zoneId: 'apse5-az1', cidr: '10.0.32.0/19', routeTableId: 'rtb-0ccc3333' },
+          { subnetId: 'subnet-0bbb2222', zoneId: 'apse5-az2', cidr: '10.0.64.0/19', routeTableId: 'rtb-0ddd4444' },
+        ],
+        endpoints: { interface: [], s3Gateway: true, s3RouteTableIds: ['rtb-0ddd4444'] },
+      },
+    });
+    synthEks(existing).hasOutput('VpcId', { Value: 'vpc-0abc1234' });
   });
 });

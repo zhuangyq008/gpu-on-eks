@@ -11,6 +11,7 @@
 |---|---|---|
 | [04 架构与使用手册](docs/04-architecture-and-operations.md) | **先看这篇** | 当前实现的架构、冷启动全流程、KEDA + Karpenter 弹性伸缩、使用和运维、可观测性怎么用 |
 | [05 测试报告](docs/05-test-report.md) | 验收 | 测试环境、方法、各项结果（部署、伸缩、回退、冷启动分段、推理性能、安全评审），以及未覆盖的项 |
+| [06 生产上线检查清单](docs/06-production-checklist.md) | 上线前 | 入口与网络安全、集群基础能力、可观测性、可靠性、运维，逐项标出已就绪 / 可配置 / 计划中 / 需要客户决策 |
 | [03 部署参数与交互](docs/03-deployment-parameters.md) | 部署人员 | CloudShell 约束、4 个问题、参数分层（含哪些已生效）、AZ 选择、命令、实现进度 |
 | [01 方案设计](docs/01-architecture-design.md) | 架构评审 | 设计目标和取舍：模型与 GPU 选型、冷启动设计、弹性设计、成本、风险。开头有「设计与当前实现的差异」 |
 | [02 可观测性设计](docs/02-observability-design.md) | 架构评审 | CloudWatch / Grafana 两种模式的完整设计（大部分还没有实现，开头有实现状态） |
@@ -24,6 +25,7 @@
 | 权重同步到 S3（逐文件校验哈希）、vLLM 从 S3 流式加载 | `status` / `test` / `scale` / `destroy` 命令 |
 | KEDA 按负载扩缩容、主力没货时自动回退 | 镜像同步到 ECR / 预缓存 |
 | 冷启动优化：NVMe + SOCI 并行拉取、S3 编译缓存 | 按负载扩缩容的压测、g7e 实机验证 |
+| 客户 Web 应用：ALB Ingress / NLB + WAF（部署时可选）、ExternalDNS（可选）、metrics-server、加密的 gp3 默认存储 | 推理 API 网关和 NetworkPolicy 的实现 |
 
 > ⚠️ **推理服务目前没有认证，只能在集群内访问**（ClusterIP）。网关上线之前，不要通过 LoadBalancer 或 Ingress 把它暴露出去。
 

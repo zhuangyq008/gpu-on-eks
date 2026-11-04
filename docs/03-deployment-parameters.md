@@ -46,6 +46,8 @@
      cdk-bootstrap 只有首次需要
      cdk-deploy    CloudFormation：网络栈 + EKS 栈（集群、系统节点组、核心 add-on、Karpenter IAM）
                    + 推理服务栈（模型桶、vLLM 和同步 Job 的 Pod Identity 角色）
+                   + 集群插件的 AWS 侧资源：metrics-server、EBS CSI（含 IAM）、按选择创建 Load Balancer Controller 的 IAM、
+                     WAF WebACL、ExternalDNS（IAM 只限所选的 Route 53 托管区域）
      kubeconfig    写到 ~/.qwenctl/<name>/kubeconfig（不覆盖客户自己的 ~/.kube/config）
      karpenter     helm 安装 karpenter-crd + karpenter（跑在系统节点上）
      nodepools     kubectl 创建 EC2NodeClass / NodePool：通用 CPU + 每个 GPU profile 一个
@@ -53,6 +55,8 @@
      metrics       helm 安装集群内 Prometheus（kube-prometheus-stack 精简版，只给 KEDA 做查询，保留 6 小时），
                    等 Prometheus 可用后才进入下一阶段
      keda          helm 安装 KEDA（跑在系统节点上）
+     addons        创建加密的 gp3 默认 StorageClass；选了「Web 应用入口」时 helm 安装 AWS Load Balancer Controller
+                   （metrics-server、EBS CSI、ExternalDNS 是 EKS 托管 add-on，在 cdk-deploy 阶段由 CloudFormation 安装）
      model-sync    集群内 Job：把锁定 revision 的模型从 HF 同步到 S3 模型桶，逐文件校验哈希；
                    S3 上已有完成标记（_COMPLETE）就直接跳过，不起 Job
      serving       每个 GPU profile 一个 vLLM Deployment（新建时主力 = minReplicas，回退 = 0；之后副本数归 KEDA 管），
@@ -64,7 +68,7 @@
 
 - **断线或失败**：CloudFormation 的变更会继续在服务端执行。重新打开 CloudShell 后运行 `./qwenctl deploy --resume`，用保存的配置从第一个未完成的阶段继续，不会再提问。
 - **更新**：`./qwenctl deploy --update` 用保存的配置重新执行所有阶段，不再提问（升级交付包后使用）。旧版本保存的配置缺少的派生字段会自动补上，客户的选择保持不变。
-- **自动化**：`--yes` 只用默认值生成配置，不会部署；要部署必须再加 `--approve`。`--plan` 只生成配置。
+- **自动化**：`--yes` 只用默认值生成配置，不会部署；要一次完成部署，用 `--yes --approve`。`--plan` 只生成配置。配置保存之后（不管是 `--plan`、`--yes` 还是部署过），再运行 `deploy` 会被拒绝，以免覆盖保存的回答；部署或继续部署保存的配置用 `--resume`。
 
 ### 1.3 权限和安全
 
@@ -132,7 +136,7 @@ $ ./qwenctl deploy
 | 1 | 网络 | **新建 VPC** / 使用现有 VPC | 选现有 VPC → 列出 VPC 让客户选；私有子网自动筛选（有 `0.0.0.0/0` 指向 NAT/TGW 的路由，并且在 §4 选出的 2 个 AZ 里），客户确认即可 | 制造业客户常有 Landing Zone，SCP 可能禁止新建 VPC 或 IGW，或者要通过 TGW/DX 连工厂网络，脚本猜不出来 | ✅ 生效（新建 VPC 已实测；现有 VPC 有单元测试，未实测） |
 | 2 | API 访问方式 | **仅 VPC 内部（internal ALB）** / 公网 HTTPS | 选公网 → 从当前 region 状态为 ISSUED 的 ACM 证书里选一个，再填来源 CIDR 白名单（不填会提示风险）。选内部 → 提示用 `qwenctl test` 在集群内验证 | 要不要暴露到公网是安全决策；公网 TLS 需要客户自己的域名和证书 | ⏳ 会保存，网关阶段生效。当前服务只在集群内 |
 | 3 | 副本数 | 最少 **2**；最多 **min(8, 配额上限)** | — | 这是成本的大头，需要客户自己定 | ✅ 生效（主力 profile 的 min/max；回退 profile 的 max） |
-| 4 | 可选能力 | **[x] 异步通道（SQS）** [ ] Bedrock 溢出；告警邮箱（可不填） | 勾选 Bedrock → 再确认一次，并检查当前 region 能不能用这个模型。填了邮箱 → 提示客户去邮箱确认 SNS 订阅 | Bedrock 溢出意味着数据会进 Bedrock、换成另一个模型，需要客户明确同意 | ⏳ 会保存，暂不生效（马来西亚没有可用的 Bedrock 模型） |
+| 4 | 可选能力 | **[x] 异步通道（SQS）** [ ] Bedrock 溢出；告警邮箱（可不填）；**[x] Web 应用入口**（AWS Load Balancer Controller + WAF）；[ ] ExternalDNS | 勾选 Bedrock → 再确认一次，并检查当前 region 能不能用这个模型。填了邮箱 → 提示客户去邮箱确认 SNS 订阅。启用 Web 应用入口、账号里有 Route 53 公有托管区域时 → 问要不要 ExternalDNS，选了就列出托管区域让客户选（最多 10 个） | Bedrock 溢出意味着数据会进 Bedrock、换成另一个模型，需要客户明确同意；客户的 Web 应用要不要对外、DNS 在不在 Route 53，脚本猜不出来 | Web 应用入口、ExternalDNS：✅ 生效。异步通道、Bedrock、告警邮箱：⏳ 会保存，暂不生效 |
 
 > 配额上限 =（G/VT On-Demand 配额 − 账号里已经在运行的 G/VT 实例占用的 vCPU）÷ 8，按 2xlarge 计算。
 
@@ -319,11 +323,12 @@ cdk:
 | 部署配置契约（Python → CDK） | ✅ zod 校验 + 契约测试 | `cli/qwenctl/models.py`、`infra/lib/config.ts`、`infra/test/contract.test.ts` |
 | CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ 新建 VPC 已真实部署；现有 VPC 只有单元测试 | `infra/lib/network-stack.ts` |
 | CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ 已真实部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
-| 客户端安装流程（11 个阶段、断点续跑、锁定版本工具） | ✅ 已真实部署 | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
+| 客户端安装流程（12 个阶段、断点续跑、锁定版本工具） | ✅ 已真实部署 | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
 | 推理服务层：模型桶 + Pod Identity，权重同步 Job，每个 GPU profile 一个 vLLM Deployment（S3 流式加载） | ✅ 已真实部署 | `infra/lib/serving-stack.ts`、`cli/qwenctl/serving.py`、`assets/model_sync.py` |
 | 弹性伸缩：集群内 Prometheus + KEDA，主力按负载扩缩容，主力没货时自动回退 | ✅ 已真实部署（按负载扩缩容还没有压测） | `cli/qwenctl/addons.py`、`autoscaling.py` |
 | 冷启动：GPU 节点 NVMe RAID0 + SOCI 并行拉取、编译缓存放 S3 | ✅ 已真实部署，新节点 6 分 02 秒 → 3 分 38 秒 | `cli/qwenctl/manifests.py`、`compile_cache.py`、`assets/compile_cache_restore.py` |
-| 网关（API Key）、可观测性（CloudWatch 模式）、镜像预缓存 / ECR | ⏳ | — |
+| 客户 Web 应用：AWS Load Balancer Controller + WAF（可选）、ExternalDNS（可选）、metrics-server、EBS CSI + 加密 gp3 默认存储 | ✅ | `cli/qwenctl/addons.py`、`questions.py`、`infra/lib/`（集群插件和 IAM） |
+| 推理 API 网关（API Key）、NetworkPolicy、可观测性（CloudWatch 模式）、镜像预缓存 / ECR | ⏳（见 [06 生产上线检查清单](06-production-checklist.md)） | — |
 | `status` / `test` / `scale` / `destroy` 等命令 | ⏳ | — |
 
 测试数据（部署、节点池扩缩容、GPU 回退、冷启动各阶段、推理性能、安全评审、自动化测试）见 [05 测试报告](05-test-report.md)；架构和用法见 [04 架构与使用手册](04-architecture-and-operations.md)。

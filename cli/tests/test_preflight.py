@@ -92,12 +92,25 @@ def test_grafana_mode_requires_amg_and_idc(gw):
 
 
 def test_bedrock_cdk_and_existing_deployment(gw):
-    stacks = {"CDKToolkit": "UPDATE_COMPLETE", "qwen-vl-bootstrap": "CREATE_COMPLETE"}
+    stacks = {"CDKToolkit": "UPDATE_COMPLETE", "qwen-vl-eks": "CREATE_COMPLETE"}
     report = _run(replace(gw, bedrock=True, stacks=stacks))
     assert report.bedrock_overflow_available
     assert report.cdk_bootstrapped
     assert report.existing_deployment
     assert "CDK 已经 bootstrap" in _titles(report, OK)
+    assert "已存在名为 qwen-vl 的部署" in _titles(report, INFO)
+
+
+def test_existing_deployment_is_detected_by_the_eks_stack(gw):
+    """旧版本查的是不存在的 <name>-bootstrap 栈，永远检测不到已有部署。"""
+    assert not _run(replace(gw, stacks={"qwen-vl-bootstrap": "CREATE_COMPLETE"})).existing_deployment
+    assert _run(replace(gw, stacks={"qwen-vl-eks": "UPDATE_COMPLETE"})).existing_deployment
+
+
+def test_codebuild_permissions_are_not_required():
+    from qwenctl.preflight import REQUIRED_ACTIONS
+
+    assert not any(a.startswith("codebuild:") for a in REQUIRED_ACTIONS)
 
 
 def test_stack_errors_degrade_to_warnings(gw):
@@ -168,15 +181,29 @@ def test_unknown_idc_and_bedrock_are_warnings_not_facts(gw):
 
 
 def test_broken_existing_deployment_fails(gw):
-    report = _run(replace(gw, stacks={"qwen-vl-bootstrap": "ROLLBACK_COMPLETE"}))
+    report = _run(replace(gw, stacks={"qwen-vl-eks": "ROLLBACK_COMPLETE"}))
     assert not report.passed
     failed = next(c for c in report.checks if c.status == FAIL)
-    assert "ROLLBACK_COMPLETE" in failed.title and "destroy" in failed.detail
+    assert "ROLLBACK_COMPLETE" in failed.title and "§5.6" in failed.detail
 
 
 def test_in_progress_deployment_fails(gw):
-    report = _run(replace(gw, stacks={"qwen-vl-bootstrap": "UPDATE_IN_PROGRESS"}))
+    report = _run(replace(gw, stacks={"qwen-vl-eks": "UPDATE_IN_PROGRESS"}))
     assert any("正在变更中" in t for t in _titles(report, FAIL))
+
+
+def test_broken_network_stack_fails_even_when_eks_stack_is_fine(gw):
+    stacks = {"qwen-vl-eks": "UPDATE_COMPLETE", "qwen-vl-network": "UPDATE_ROLLBACK_FAILED"}
+    report = _run(replace(gw, stacks=stacks))
+    assert report.existing_deployment and not report.passed
+    failed = next(c for c in report.checks if c.status == FAIL)
+    assert "UPDATE_ROLLBACK_FAILED" in failed.title and "qwen-vl-network" in failed.detail
+
+
+def test_interrupted_first_deploy_counts_as_existing(gw):
+    report = _run(replace(gw, stacks={"qwen-vl-network": "CREATE_COMPLETE"}))
+    assert report.existing_deployment
+    assert any("已存在名为 qwen-vl 的部署" in t for t in _titles(report, INFO))
 
 
 def test_broken_cdk_toolkit_warns(gw):

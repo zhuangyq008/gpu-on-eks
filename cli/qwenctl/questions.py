@@ -11,8 +11,9 @@ from .az_select import AzSelection, AzSelectionError, select_azs
 from .capacity import estimate_cost, replica_defaults
 from .catalog import GPU_QUOTA_CODE, MAX_GPU_REPLICAS, PROFILES
 from .console import Aborted, Console
-from .gateway import AwsGateway, EndpointServices, GatewayError
+from .gateway import AwsGateway, EndpointServices, GatewayError, HostedZone
 from .models import AccessChoice, Answers, CapacityChoice, FeatureChoice, NetworkChoice, SubnetRef
+from .names import is_hosted_zone
 from .network import (
     PRIVATE,
     PUBLIC,
@@ -50,7 +51,7 @@ def ask_all(
     network = ask_network(console, report, report.selection, gw, advanced["network"]["cidr"])
     access = ask_access(console, network, gw)
     capacity = ask_capacity(console, report, network.selection)
-    features = ask_features(console, report)
+    features = ask_features(console, report, gw)
     answers = Answers(network=network.choice, access=access, capacity=capacity, features=features)
     return answers, network.selection
 
@@ -238,7 +239,7 @@ def ask_capacity(console: Console, report: PreflightReport, selection: AzSelecti
 
 
 # ---- 4. 可选能力 ----
-def ask_features(console: Console, report: PreflightReport) -> FeatureChoice:
+def ask_features(console: Console, report: PreflightReport, gw: AwsGateway) -> FeatureChoice:
     console.line("  4. 可选能力")
     async_on = console.ask_bool("启用异步通道（SQS）？", True)
     overflow = False
@@ -253,7 +254,65 @@ def ask_features(console: Console, report: PreflightReport) -> FeatureChoice:
     email = console.ask_text("告警邮箱（留空 = 不发邮件）", "", validate_email)
     if email:
         console.status("info", "部署后请到邮箱点击 SNS 订阅确认链接")
-    return FeatureChoice(async_channel=async_on, bedrock_overflow=overflow, alert_email=email or None)
+    web = ask_web_ingress(console)
+    zones = ask_external_dns(console, gw) if web else ()
+    return FeatureChoice(
+        async_channel=async_on,
+        bedrock_overflow=overflow,
+        alert_email=email or None,
+        web_ingress=web,
+        dns_zones=zones,
+    )
+
+
+def ask_web_ingress(console: Console) -> bool:
+    console.line(
+        "     Web 应用入口：客户自己的 Web 应用要通过 ALB（Ingress）或 NLB 对外（包括公网）提供服务时需要"
+    )
+    return console.ask_bool("安装 AWS Load Balancer Controller，并创建给公网 ALB 用的 WAF？", True)
+
+
+MAX_DNS_ZONES = 10
+
+
+def ask_external_dns(console: Console, gw: AwsGateway) -> Tuple[HostedZone, ...]:
+    """可选：ExternalDNS 按 Ingress / Service 上的域名，自动在 Route 53 里建记录（只增不删）。"""
+    try:
+        zones = tuple(gw.public_hosted_zones())
+    except GatewayError as exc:
+        console.status("warn", "无法列出 Route 53 托管区域，跳过 ExternalDNS", str(exc))
+        return ()
+    # 区域 ID 和名字会拼进 IAM ARN 和 ExternalDNS 配置：不是标准域名的（例如含转义字符）不列出
+    usable = tuple(z for z in zones if is_hosted_zone(z.zone_id, z.name))
+    if len(usable) < len(zones):
+        console.status("info", f"有 {len(zones) - len(usable)} 个托管区域的名字不是标准域名，不列出")
+    zones = usable
+    if not zones:
+        console.status(
+            "info", "账号里没有 Route 53 公有托管区域，跳过 ExternalDNS（客户在自己的 DNS 上把域名指向 ALB）"
+        )
+        return ()
+    if not console.ask_bool("用 ExternalDNS 自动在 Route 53 里为 Ingress 建 DNS 记录？（只增不删）", False):
+        return ()
+    for index, zone in enumerate(zones, start=1):
+        console.line(f"       [{index}] {zone.name}  ({zone.zone_id})")
+    raw = console.ask_text(
+        f"允许 ExternalDNS 管理哪些托管区域？（编号，逗号分隔，最多 {MAX_DNS_ZONES} 个）",
+        "1",
+        lambda text: _zone_indexes(text, len(zones))[1],
+    )
+    indexes, _ = _zone_indexes(raw, len(zones))
+    return tuple(zones[i - 1] for i in indexes)
+
+
+def _zone_indexes(raw: str, count: int) -> Tuple[Tuple[int, ...], Optional[str]]:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts or not all(p.isdigit() and 1 <= int(p) <= count for p in parts):
+        return (), f"请输入 1~{count} 之间的编号，多个用逗号分隔"
+    indexes = tuple(dict.fromkeys(int(p) for p in parts))
+    if len(indexes) > MAX_DNS_ZONES:
+        return (), f"最多选 {MAX_DNS_ZONES} 个托管区域"
+    return indexes, None
 
 
 def validate_email(raw: str) -> Optional[str]:

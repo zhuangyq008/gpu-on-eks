@@ -7,7 +7,10 @@
     "kube-proxy": "v1.36.0-eksbuild.58",
     "coredns": "v1.14.7-eksbuild.22",
     "eks-pod-identity-agent": "v1.4.1-eksbuild.3",
-    "eks-node-monitoring-agent": "v1.7.6-eksbuild.1"
+    "eks-node-monitoring-agent": "v1.7.6-eksbuild.1",
+    "metrics-server": "v0.9.0-eksbuild.14",
+    "aws-ebs-csi-driver": "v1.67.2-eksbuild.1",
+    "external-dns": "v0.24.0-eksbuild.1"
   },
   "tools": {
     "kubectl": {
@@ -48,6 +51,11 @@
       "repository": "https://kedacore.github.io/charts",
       "version": "2.21.0",
       "sha256": "a7da56bf41a33dad9d2fc82a6fdecee552fff947d80bf1e1dbcf4db0f9e26dee"
+    },
+    "aws-load-balancer-controller": {
+      "repository": "https://aws.github.io/eks-charts",
+      "version": "3.6.2",
+      "sha256": "9255bf39873b6cb31106dbe61dc87c3617bff4197783b5b94381811a13f99c3c"
     }
   },
   "images": {
@@ -60,5 +68,13 @@
     "id": "Qwen/Qwen3.5-35B-A3B-FP8",
     "revision": "9d1823d2dee688a6b25e77009dc727688c44936e",
     "sizeGB": 37.5
+  },
+  "policies": {
+    "_comment": "上游 IAM 策略原文放在 infra/lib/policies/，这里锁定来源和 sha256，CDK 测试会校验",
+    "aws-load-balancer-controller": {
+      "version": "v3.6.2",
+      "source": "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v3.6.2/docs/install/iam_policy.json",
+      "sha256": "16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a"
+    }
   }
 }

@@ -17,7 +17,8 @@ CERT = Certificate("arn:aws:acm:ap-southeast-5:123456789012:certificate/abc", "a
 
 def _ask(gw: FakeGateway, answers, assume_defaults=False):
     report = run_preflight(gw, "qwen-vl", ADV)
-    con, out = make_console(answers, assume_defaults)
+    # 提问 4 的最后一项是「Web 应用入口」：多给一个回车（默认启用）；没用到的回答会被忽略
+    con, out = make_console([*answers, ""], assume_defaults)
     result = ask_all(con, report, gw, ADV)
     return result, out.getvalue()
 

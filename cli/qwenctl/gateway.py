@@ -23,6 +23,14 @@ class Certificate:
 
 
 @dataclass(frozen=True)
+class HostedZone:
+    """Route 53 公有托管区域。zone_id 不带 /hostedzone/ 前缀，name 不带结尾的点。"""
+
+    zone_id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class EndpointServices:
     """VPC 里已有的终端节点（短服务名，例如 "sts"、"s3"）。"""
 
@@ -92,3 +100,5 @@ class AwsGateway(Protocol):
         """服务短名 -> 提供该接口终端节点的 zone_id。None = 无法判断。"""
 
     def issued_certificates(self) -> Sequence[Certificate]: ...
+
+    def public_hosted_zones(self) -> Sequence[HostedZone]: ...

@@ -1,5 +1,6 @@
 /**
- * EKS 栈：集群、系统节点组、核心 add-on、访问授权、Karpenter 的 AWS 侧资源。
+ * EKS 栈：集群、系统节点组、核心 add-on、访问授权、Karpenter 的 AWS 侧资源，
+ * 以及客户 Web 应用用的集群插件（metrics-server、EBS CSI、可选的 Load Balancer Controller IAM + WAF、ExternalDNS）。
  *
  * 全部用 CloudFormation 原生资源（AWS::EKS::*），不用 CDK 的 kubectl Lambda 自定义资源。
  * 集群内的组件（Karpenter、KEDA 等 Helm chart）由执行 qwenctl 的客户端安装（docs/03 §1）。
@@ -10,11 +11,19 @@ import * as eks from 'aws-cdk-lib/aws-eks';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
+import { ClusterAddons, SystemPlacement } from './cluster-addons';
 import { DeploymentConfig } from './config';
 import { KarpenterIam } from './karpenter-iam';
-import { ADDONS_AFTER_NODES, ADDONS_BEFORE_NODES, Versions } from './versions';
+import { LoadBalancerController } from './load-balancer-controller';
+import { ADDONS_AFTER_NODES, ADDONS_BEFORE_NODES, Versions, addonVersion } from './versions';
 
 export const SYSTEM_NODE_LABEL = 'qwenctl/node-role';
+const SYSTEM_TAINT_KEY = 'CriticalAddonsOnly';
+/** 系统节点组带 CriticalAddonsOnly 污点，插件要按这个 nodeSelector + 容忍才能调度上去 */
+const SYSTEM_PLACEMENT: SystemPlacement = {
+  nodeSelector: { [SYSTEM_NODE_LABEL]: 'system' },
+  tolerations: [{ key: SYSTEM_TAINT_KEY, operator: 'Exists' }],
+};
 const CLUSTER_ADMIN_POLICY = 'arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy';
 // audit：谁用集群管理员权限做了什么（安全审计）
 const CONTROL_PLANE_LOG_TYPES = ['api', 'audit', 'authenticator', 'scheduler'];
@@ -28,6 +37,8 @@ export interface EksStackProps extends cdk.StackProps {
 export class EksStack extends cdk.Stack {
   public readonly cluster: eks.CfnCluster;
   public readonly karpenter: KarpenterIam;
+  public readonly addons: ClusterAddons;
+  public readonly loadBalancerController?: LoadBalancerController;
 
   constructor(scope: Construct, id: string, props: EksStackProps) {
     super(scope, id, props);
@@ -51,6 +62,21 @@ export class EksStack extends cdk.Stack {
       addon.addResourceDependency(nodegroup, 'CoreDNS 等需要节点才能 Ready'),
     );
     this.karpenter = new KarpenterIam(this, 'Karpenter', { clusterName: config.name, cluster: this.cluster });
+    this.addons = new ClusterAddons(this, 'ClusterAddons', {
+      config,
+      versions,
+      cluster: this.cluster,
+      nodegroup,
+      placement: SYSTEM_PLACEMENT,
+    });
+    if (config.addons.ingress.enabled) {
+      this.loadBalancerController = new LoadBalancerController(this, 'LoadBalancerController', {
+        clusterName: config.name,
+        cluster: this.cluster,
+        vpcId: vpc.vpcId,
+        versions,
+      });
+    }
 
     const outputs: Record<string, string> = {
       ClusterName: this.cluster.ref,
@@ -58,6 +84,10 @@ export class EksStack extends cdk.Stack {
       KarpenterNodeRoleName: this.karpenter.nodeRole.roleName,
       KarpenterInterruptionQueueName: this.karpenter.interruptionQueue.queueName,
       PrivateSubnetIds: privateSubnetIds.join(','),
+      // 节点的 IMDS hop limit 是 1，qwenctl 装 Load Balancer Controller 时要显式传 vpcId
+      VpcId: vpc.vpcId,
+      // 客户在 Ingress 上用注解 alb.ingress.kubernetes.io/wafv2-acl-arn 挂载
+      ...(this.loadBalancerController ? { WebAclArn: this.loadBalancerController.webAcl.attrArn } : {}),
     };
     for (const [key, value] of Object.entries(outputs)) {
       new cdk.CfnOutput(this, key, { value });
@@ -116,18 +146,15 @@ function addAddons(
   versions: Versions,
   names: readonly string[],
 ): eks.CfnAddon[] {
-  return names.map((name) => {
-    const version = versions.eksAddons[name];
-    if (!version) {
-      throw new Error(`versions.json 里缺少 EKS add-on ${name} 的版本`);
-    }
-    return new eks.CfnAddon(scope, `Addon-${name}`, {
-      clusterName: cluster.ref,
-      addonName: name,
-      addonVersion: version,
-      resolveConflicts: 'OVERWRITE',
-    });
-  });
+  return names.map(
+    (name) =>
+      new eks.CfnAddon(scope, `Addon-${name}`, {
+        clusterName: cluster.ref,
+        addonName: name,
+        addonVersion: addonVersion(versions, name),
+        resolveConflicts: 'OVERWRITE',
+      }),
+  );
 }
 
 function createSystemNodegroup(
@@ -158,7 +185,7 @@ function createSystemNodegroup(
     updateConfig: { maxUnavailable: 1 },
     labels: { [SYSTEM_NODE_LABEL]: 'system' },
     // 只跑 Karpenter 和插件；客户业务落在 Karpenter 的通用节点池
-    taints: [{ key: 'CriticalAddonsOnly', value: 'true', effect: 'NO_SCHEDULE' }],
+    taints: [{ key: SYSTEM_TAINT_KEY, value: 'true', effect: 'NO_SCHEDULE' }],
   });
 }
 

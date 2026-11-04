@@ -34,8 +34,11 @@ EKS_OUTPUTS = {
     "KarpenterNodeRoleName": "node-role",
     "KarpenterInterruptionQueueName": "queue-1",
     "PrivateSubnetIds": "subnet-0a,subnet-0b",
+    "VpcId": "vpc-0abc",
+    "WebAclArn": "arn:aws:wafv2:ap-southeast-5:123456789012:regional/webacl/qwen-vl-web/abc",
 }
 CHART_BYTES = {
+    "aws-load-balancer-controller": b"fake-lbc-chart",
     "karpenter-crd": b"fake-crd-chart",
     "karpenter": b"fake-karpenter-chart",
     "kube-prometheus-stack": b"fake-kps-chart",
@@ -753,3 +756,134 @@ def test_every_profile_with_a_ready_pod_gets_its_cache_saved(tmp_path):
     run_install(ctx, resume=False)
     keys = sorted(u[u.index("--key") + 1] for u in _uploads(runner))
     assert keys == sorted(_expected_key(tmp_path, p) for p in ("g7e-1gpu", "g6-tp2"))
+
+
+def _lbc_installs(runner):
+    return [c for c in runner.commands() if "upgrade --install aws-load-balancer-controller" in c]
+
+
+def test_addons_phase_creates_encrypted_default_storage_and_installs_lbc(tmp_path):
+    runner = FakeRunner()
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    (sc,) = _applied(runner, "StorageClass")
+    assert sc["parameters"]["encrypted"] == "true" and sc["parameters"]["type"] == "gp3"
+    (install,) = _lbc_installs(runner)
+    assert "--namespace kube-system" in install
+    with open(
+        os.path.join(ctx.paths.root, "aws-load-balancer-controller-values.json"), encoding="utf-8"
+    ) as handle:
+        values = json.load(handle)
+    assert values["vpcId"] == "vpc-0abc" and values["enableServiceMutatorWebhook"] is False
+    assert "alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:" in out.getvalue()
+
+
+def test_addons_phase_runs_after_keda_and_before_model_sync(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    keys = [key for key, _title, _action in PHASES]
+    assert keys.index("keda") < keys.index("addons") < keys.index("model-sync")
+    state = run_install(ctx, resume=False)
+    assert "addons" in state["completed"]
+
+
+def test_lbc_is_skipped_when_web_ingress_is_not_selected(tmp_path):
+    runner = FakeRunner()
+    ctx, out = _ctx(tmp_path, runner)
+    addons = {**ctx.config["addons"], "ingress": {"enabled": False}}
+    ctx = dataclasses.replace(ctx, config={**ctx.config, "addons": addons})
+    run_install(ctx, resume=False)
+    assert _lbc_installs(runner) == []
+    assert len(_applied(runner, "StorageClass")) == 1  # 默认存储照样创建
+    assert "跳过 AWS Load Balancer Controller" in out.getvalue()
+
+
+def test_storage_class_uses_customer_cmk(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    cmk = "arn:aws:kms:ap-southeast-5:123456789012:key/11111111-2222-3333-4444-555555555555"
+    advanced = {
+        **ctx.config["advanced"],
+        "compliance": {**ctx.config["advanced"]["compliance"], "kms_key_arn": cmk},
+    }
+    ctx = dataclasses.replace(ctx, config={**ctx.config, "advanced": advanced})
+    run_install(ctx, resume=False)
+    assert _applied(runner, "StorageClass")[0]["parameters"]["kmsKeyId"] == cmk
+
+
+def test_missing_vpc_output_fails_the_addons_phase(tmp_path, monkeypatch):
+    from qwenctl import installer
+
+    outputs = {k: v for k, v in EKS_OUTPUTS.items() if k != "VpcId"}
+    monkeypatch.setattr(installer, "eks_outputs", lambda _ctx: outputs)
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    with pytest.raises(InstallError) as err:
+        run_install(ctx, resume=False)
+    assert err.value.phase == "addons" and "VpcId" in str(err.value)
+
+
+def test_admission_policies_are_applied_with_the_controller(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    policies = _applied(runner, "ValidatingAdmissionPolicy")
+    assert [p["metadata"]["name"] for p in policies] == ["qwenctl-lb-service-class", "qwenctl-public-alb-waf"]
+    # 按部署的 region 和推理命名空间生成
+    assert "'qwen-vl'" in policies[0]["spec"]["validations"][1]["expression"]
+    assert f":wafv2:{ctx.region}:{ctx.account}:" in policies[1]["spec"]["validations"][1]["expression"]
+    assert any(
+        "annotate storageclass gp2 storageclass.kubernetes.io/is-default-class=false" in c
+        for c in runner.commands()
+    )
+
+
+def test_no_admission_policies_without_the_controller(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    addons = {**ctx.config["addons"], "ingress": {"enabled": False}}
+    ctx = dataclasses.replace(ctx, config={**ctx.config, "addons": addons})
+    run_install(ctx, resume=False)
+    assert _applied(runner, "ValidatingAdmissionPolicy") == []
+    # 以前启用过、后来关掉：把护栏一起删掉
+    delete = [c for c in runner.commands() if " delete validatingadmissionpolicybinding," in c]
+    assert len(delete) == 1
+    assert "qwenctl-lb-service-class qwenctl-public-alb-waf --ignore-not-found" in delete[0]
+    assert not any("upgrade --install aws-load-balancer-controller" in c for c in runner.commands())
+
+
+def test_disabling_ingress_warns_when_the_controller_is_still_installed(tmp_path):
+    class InstalledRunner(FakeRunner):
+        def run(self, args, **kwargs):
+            if "list" in args and "--filter" in args:
+                return CommandResult(0, "aws-load-balancer-controller\n")
+            return super().run(args, **kwargs)
+
+    for runner, warned in ((FakeRunner(), False), (InstalledRunner(), True)):
+        ctx, out = _ctx(tmp_path / str(warned), runner)
+        addons = {**ctx.config["addons"], "ingress": {"enabled": False}}
+        ctx = dataclasses.replace(ctx, config={**ctx.config, "addons": addons})
+        run_install(ctx, resume=False)
+        assert ("还装着 aws-load-balancer-controller" in out.getvalue()) is warned
+        # 只提示，不自动卸载：还有 Ingress 时卸载会遗留负载均衡器
+        assert not any("uninstall" in c for c in runner.commands())
+
+
+def test_missing_gp2_is_fine_but_other_errors_fail(tmp_path):
+    runner = FakeRunner(fail_on="annotate storageclass gp2")
+    ctx, _ = _ctx(tmp_path, runner)
+    with pytest.raises(InstallError) as err:
+        run_install(ctx, resume=False)
+    assert err.value.phase == "addons"
+
+    class NotFoundRunner(FakeRunner):
+        def run(self, args, **kwargs):
+            if "annotate" in args:
+                raise CommandError(
+                    args, 1, 'Error from server (NotFound): storageclasses.storage.k8s.io "gp2" not found'
+                )
+            return super().run(args, **kwargs)
+
+    ok = NotFoundRunner()
+    ctx, _ = _ctx(tmp_path / "second", ok)
+    assert "addons" in run_install(ctx, resume=False)["completed"]

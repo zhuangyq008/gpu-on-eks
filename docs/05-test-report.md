@@ -9,14 +9,15 @@
 
 | 验证项 | 目标 | 结果 | 结论 |
 |---|---|---|---|
-| CloudShell 一键部署 | 回答 4 个问题即可部署，断线可续跑 | 首次部署约 17 分钟（网络、EKS、Karpenter）；11 个阶段都验证过 `--resume` / `--update` | ✅ 通过 |
+| CloudShell 一键部署 | 回答 4 个问题即可部署，断线可续跑 | 首次部署约 17 分钟（网络、EKS、Karpenter）；12 个阶段都验证过 `--resume` / `--update` | ✅ 通过 |
 | 非 GPU 业务共用集群 | 客户普通 Pod 不做任何设置就能运行 | Pod 从 apply 到 Ready 37 s（Karpenter 新拉 CPU 节点），删除业务后 130 s 回收节点 | ✅ 通过 |
 | 主力 GPU 没货时自动回退 | 不需要人工干预 | g7e 整个测试期间都没有容量（ICE）。KEDA 自动扩出 g6.12xlarge 回退副本，Karpenter 41 s 拉起节点 | ✅ 通过 |
 | 新节点冷启动 | ≤ 3 分钟 | 基线 6 分 02 秒 → **优化后 3 分 38 秒**（复测 3 分 34 秒） | ⚠️ 改善 40%，离目标还差约 40 s |
 | 推理正确性 | 图片 → 结构化 JSON | 设备铭牌 7 个字段全部识别正确 | ✅ 通过 |
 | 推理性能（g6.12xlarge TP=2） | — | 铭牌图片 → JSON 1.16 s；8 路并发 TTFT p50 0.46 s，输出 314 tok/s | 作为回退机型可用 |
-| 安全 | 没有遗留 CRITICAL/HIGH | 每次部署前都做安全评审（3 个阶段、5 次），另有 2 轮代码评审；没有 CRITICAL，HIGH 全部修复 | ✅ 通过 |
-| 自动化测试 | 覆盖率 ≥ 80% | Python 349 个，覆盖率 98%（Python 3.12；3.9 下跑 342 个，权重同步脚本的测试需要 huggingface_hub，所以跳过）；CDK 52 个 | ✅ 通过 |
+| 客户 Web 应用对公网服务 | ALB / NLB + WAF、HPA、持久卷；有防误暴露的护栏 | 公网 ALB 和 NLB 1 分钟内就绪；WAF 拦截 XSS / SQL 注入；HPA、加密 gp3 卷正常；8 项防误暴露的反向测试全部被拒；删除后负载均衡器和安全组都清理干净 | ✅ 通过（§7a） |
+| 安全 | 没有遗留 CRITICAL/HIGH | 每次部署和推送前都做安全评审（4 轮，另有复查，见 §8），另有 2 轮代码评审；没有 CRITICAL，HIGH 全部修复 | ✅ 通过 |
+| 自动化测试 | 覆盖率 ≥ 80% | Python 400 个，覆盖率 98%（Python 3.12；3.9 下跑 393 个，权重同步脚本的测试需要 huggingface_hub，所以跳过）；CDK 130 个，覆盖率 99% | ✅ 通过 |
 
 **这一阶段没有测到的内容**（详见 §10）：
 - g7e 实机：一直 ICE，Blackwell 驱动和性能都没测到；
@@ -167,6 +168,58 @@
 
 ---
 
+## 7a. 客户 Web 应用插件（2026-11-04）
+
+测试的是客户「部署之后再启用」的路径：在已有部署的 `config.json` 里把 `addons.ingress.enabled` 改成 `true`，再执行更新。
+
+**安装**
+
+| 项 | 结果 |
+|---|---|
+| CloudFormation（EKS 栈更新） | ✅ 新增 metrics-server、aws-ebs-csi-driver 两个 add-on（都是 ACTIVE），以及 Load Balancer Controller 的 IAM 角色和 WAF WebACL |
+| 集群内 | ✅ Load Balancer Controller、EBS CSI 控制器、metrics-server 各 2 副本，都在系统节点上。`kubectl top` 正常。`gp3` 是默认 StorageClass，`gp2` 已取消默认。IngressClass `alb` 和 IngressClassParams 已创建。两条准入策略的类型检查通过 |
+
+**正向测试**（nginx 2 副本 + 公网 ALB Ingress（挂 WAF）+ 公网 NLB（只放行测试机 IP）+ HPA + 5 GiB PVC）
+
+| 项 | 结果 |
+|---|---|
+| 业务 Pod 调度 | Karpenter 拉起一台 c7i-flex.large 通用节点 |
+| ALB / NLB 创建 | 1 分钟内拿到地址，`SuccessfullyReconciled`。约 4 分钟后公网能访问（DNS 生效） |
+| 公网 ALB 正常请求 | 200 |
+| WAF | 查询参数带 XSS → **403**；带 SQL 注入 → **403**；20 KB 请求体没有被大小规则拦截（nginx 自己返回 405）。ALB 已关联 WebACL `<name>-ingress` |
+| 公网 NLB | 测试机 IP → 200；NLB 安全组的入站来源只有这个 IP/32 |
+| PVC | 默认 `gp3`，EBS 卷 gp3、**已加密**，读写正常 |
+| HPA | `cpu: 0%/60%`，能读到指标 |
+
+**反向测试（防误暴露）**
+
+| 操作 | 结果 |
+|---|---|
+| `type: LoadBalancer` 的 Service 不写 `loadBalancerClass` | **被拒**（准入策略 `qwenctl-lb-service-class`） |
+| 公网 Ingress 不带 `wafv2-acl-arn` | **被拒**（准入策略 `qwenctl-public-alb-waf`） |
+| 在推理命名空间 `qwen-vl` 里建 `alb` Ingress | 对象能建，但控制器拒绝处理（`namespaceSelector of IngressClassParams alb mismatch`），**没有建出 ALB** |
+| 用旧的 `kubernetes.io/ingress.class: alb` 注解（绕过上一条的命名空间限制） | **被拒**（`qwenctl-public-alb-waf`） |
+| 公网 Ingress 的 `wafv2-acl-arn` 写 `none`；写别的 region（us-east-1）的 WebACL ARN | 都**被拒**（`qwenctl-public-alb-waf`） |
+| 公网 Ingress 的 `wafv2-acl-arn` 写别的账号的 WebACL ARN | **被拒**（`qwenctl-public-alb-waf`） |
+| 在 `qwen-vl`、`monitoring`、`keda`、`kube-system` 里建带 `loadBalancerClass` 的 NLB Service | 4 个命名空间都**被拒**（`qwenctl-lb-service-class`） |
+
+对照（应该允许的）：公网 Ingress 带本 region 的正确 WebACL ARN、internal Ingress 不带 WAF、`default` 里带 `loadBalancerClass` 的 NLB Service，都能创建。
+后 4 行反向测试和对照组是在护栏加强之后补测的，用 `kubectl apply --dry-run=server`：准入策略会真实求值，但不会创建对象。
+
+**护栏加强后的补充测试**
+
+| 操作 | 结果 |
+|---|---|
+| 正在删除的对象：`qwen-vl` 里一个带 finalizer 的 Service，删除前改成 `type: LoadBalancer` | 删除前**被拒**；删除中**放行**，摘掉 finalizer 后对象正常消失（不会卡在 Terminating） |
+| 公网 Ingress 写一个**格式正确、但不存在**的本账号 WebACL ARN（来源限定为 TEST-NET 地址 `203.0.113.1/32`，外部访问不到） | 准入策略放行（它查不到 WebACL 是否存在）。控制器**建出了公网 ALB 和 HTTP:80 监听器，但没有 WAF**，然后不断重试关联 WAF（`FailedDeployModel ... AssociateWebACL ... 400`），Ingress 上一直没有地址。已经写进 [04 §5.8](04-architecture-and-operations.md#58-部署客户-web-应用并对外提供服务)，包括怎么检查。删除命名空间后 21 秒内，ALB 和安全组都清理干净 |
+
+**清理**：删除测试命名空间后，80 秒内两个负载均衡器、它们的安全组和 PVC 的 EBS 卷都删掉了。从创建到删除的整个过程中，控制器日志里没有一次 AccessDenied。这说明按 region / 账号 / VPC / 集群名收紧后的 IAM 权限，覆盖了完整的生命周期。
+
+**没有测到的**：
+- ExternalDNS：域名方案还没定，测试中没有开启（IAM 策略和 add-on 配置只有单元测试）。上线前建议用一个临时的托管区域实测一次；
+- HTTPS 监听器：需要客户的 ACM 证书；
+- 按 CPU 实际扩容的 HPA 压测。
+
 ## 8. 安全评审
 
 每次部署和推送前都由独立的安全评审检查（IAM、密钥、认证、输入校验与注入、S3 公开访问、CORS、供应链）。
@@ -176,6 +229,9 @@
 | 1（11-03） | 部署工具、CDK、Karpenter | 0 / 0 | 5 / 5 | 全部修复 |
 | 2（11-04） | 弹性伸缩（Prometheus、KEDA） | 0 / 0 | 3 / 8 | 修复 10 个；1 个 LOW 接受（副本数交接遇到冲突时不重试，会安全失败） |
 | 3（11-04） | 冷启动（编译缓存、RAID0、SOCI） | 0 / 0 | 2 / 6 | 修复 7 个；1 个 LOW 留到生产加固（桶策略显式拒绝其他主体写缓存前缀） |
+| 4（11-04） | 客户 Web 应用插件（LBC、WAF、ExternalDNS、EBS CSI、准入策略） | 0 / 0 | 6 / 6 | 6 个 MEDIUM 全部修复：WAF 加 SQL 注入规则并写明请求体检查的局限；准入策略防止公网 Classic LB 和不挂 WAF 的公网 ALB；推理和系统命名空间不能用 `alb`；LBC 的 tag 条件绑定到本集群、建安全组限定 VPC、删掉不用的 WAF Classic 和 Shield 权限；ExternalDNS 在 IAM 层只允许新建和更新；同名部署也检查本地配置和网络栈。LOW 修复 4 个，剩下 2 个（Pod Identity 信任策略加 SourceAccount / SourceArn、上传路径的 WAF 规则）留到生产加固 |
+| 4 复查 ①（11-04） | 上一行的修复 | 0 / 0 | 2 / 3 | 准入策略的绕过路径已修复：旧的 `ingress.class` 注解、WAF 注解的值（必须是本 region 的 WebACL ARN）、受保护命名空间里的 `type: LoadBalancer` Service；关掉 Web 入口时一起删除准入策略；环境检查同时看 EKS 栈和网络栈的状态。剩下：ExternalDNS 没有实测（见 §7a）；控制器的监听器、规则和 WAF 关联权限只能限定到 region 和账号（记录在 [06 §1.9](06-production-checklist.md#1-入口与网络安全)） |
+| 4 复查 ②（11-04） | 复查 ① 的修复 | 0 / 0 | 2 / 2 | WAF 注解限定本账号；正在删除的对象不检查（否则卡在 Terminating）；关掉 Web 入口时控制器还没卸载会提示。WebACL 不存在时的行为已实测并写进文档。1 个 LOW 不改：`loadBalancerClass` 不限定成 nlb，EKS 自带的控制器不处理带 class 的 Service，不会建出 Classic LB；限定成 nlb 的话客户以后装别的 LB 控制器就用不了 |
 | 代码评审 ×2 | 弹性伸缩、冷启动 | 0 / 3（弹性伸缩 1 个、冷启动 2 个） | 若干 | HIGH 和 MEDIUM 全部修复 |
 
 重点修复：

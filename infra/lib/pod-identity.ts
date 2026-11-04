@@ -21,6 +21,8 @@ export interface PodIdentityRoleProps {
   readonly namespace: string;
   readonly serviceAccount: string;
   readonly description: string;
+  /** 和集群在同一个栈里时传入：关联用 cluster.ref，保证集群先创建（跨栈时由栈依赖保证） */
+  readonly cluster?: eks.CfnCluster;
 }
 
 /** 创建角色并关联到 ServiceAccount */
@@ -30,7 +32,7 @@ export function podIdentityRole(scope: Construct, id: string, props: PodIdentity
     assumedBy: podIdentityPrincipal(props.clusterName, props.namespace, props.serviceAccount),
   });
   new eks.CfnPodIdentityAssociation(scope, `${id}Association`, {
-    clusterName: props.clusterName,
+    clusterName: props.cluster?.ref ?? props.clusterName,
     namespace: props.namespace,
     serviceAccount: props.serviceAccount,
     roleArn: role.roleArn,

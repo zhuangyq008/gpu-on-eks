@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import { LOG_RETENTION_DAYS, loadConfig, parseCidr, parseConfig } from '../lib/config';
+import { DeploymentConfig, LOG_RETENTION_DAYS, loadConfig, parseCidr, parseConfig } from '../lib/config';
 import { FIXTURE_PATH, fixture, rawFixture, withOverrides } from './helpers';
 
 const EXISTING = {
@@ -93,6 +93,32 @@ describe('部署配置校验', () => {
     expect(() => withOverrides(fixture(), { network: { endpoints: upper } })).toThrow(/短服务名/);
   });
 
+  test.each([
+    'arn:aws:kms:ap-southeast-5:123456789012:key/11111111-2222-3333-4444-555555555555',
+    'arn:aws:kms:ap-southeast-5:123456789012:key/mrk-1234abcd12ab34cd56ef1234567890ab',
+    'arn:aws-cn:kms:cn-north-1:123456789012:key/11111111-2222-3333-4444-555555555555',
+  ])('接受 KMS 密钥 ARN %s', (arn) => {
+    const base = fixture();
+    const config = withOverrides(base, { advanced: { compliance: { ...base.advanced.compliance, kms_key_arn: arn } } });
+    expect(config.advanced.compliance.kms_key_arn).toBe(arn);
+  });
+
+  test.each([
+    ['别名', 'arn:aws:kms:ap-southeast-5:123456789012:alias/qwen-vl'],
+    ['别名名称', 'alias/qwen-vl'],
+    ['只有密钥 ID', '11111111-2222-3333-4444-555555555555'],
+    ['账号不是 12 位', 'arn:aws:kms:ap-southeast-5:12345:key/11111111-2222-3333-4444-555555555555'],
+    ['缺少 region', 'arn:aws:kms::123456789012:key/11111111-2222-3333-4444-555555555555'],
+    ['密钥 ID 不是 UUID', 'arn:aws:kms:ap-southeast-5:123456789012:key/not-a-key'],
+    ['大写的密钥 ID', 'arn:aws:kms:ap-southeast-5:123456789012:key/11111111-2222-3333-4444-55555555555A'],
+    ['不是 KMS', 'arn:aws:s3:ap-southeast-5:123456789012:key/11111111-2222-3333-4444-555555555555'],
+  ])('拒绝不是密钥 ARN 的 kms_key_arn：%s', (_label, arn) => {
+    const base = fixture();
+    expect(() =>
+      withOverrides(base, { advanced: { compliance: { ...base.advanced.compliance, kms_key_arn: arn } } }),
+    ).toThrow(/advanced\.compliance\.kms_key_arn: 应该是 KMS 密钥 ARN.*不能用别名/);
+  });
+
   test('日志保留天数必须是 CloudWatch 支持的值，并且都在 CDK 的枚举里', () => {
     const raw = rawFixture() as { advanced: { observability: Record<string, unknown> } };
     const advanced = {
@@ -110,5 +136,65 @@ describe('部署配置校验', () => {
     fs.writeFileSync(broken, '{not json');
     expect(() => loadConfig(path.join(dir, 'missing.json'))).toThrow(/无法读取部署配置/);
     expect(() => loadConfig(broken)).toThrow(/不是合法的 JSON/);
+  });
+});
+
+describe('集群插件配置（addons）', () => {
+  const ZONE = { id: 'Z0123456789ABCDEFGHIJ', name: 'example.com' };
+  const withDns = (externalDns: DeploymentConfig['addons']['externalDns'], ingress = true): DeploymentConfig =>
+    withOverrides(fixture(), { addons: { ingress: { enabled: ingress }, externalDns } });
+
+  test('旧版配置没有 addons 时用默认值（全部关闭），每次解析得到新对象', () => {
+    const legacy = Object.fromEntries(Object.entries(rawFixture()).filter(([key]) => key !== 'addons'));
+    const first = parseConfig(legacy);
+    expect(first.addons).toEqual({ ingress: { enabled: false }, externalDns: { enabled: false, hostedZones: [] } });
+    expect(parseConfig(legacy).addons).not.toBe(first.addons);
+  });
+
+  test('addons 只能整段省略：写了就要完整（qwenctl 总是写出完整的一段）', () => {
+    const partial = { ...rawFixture(), addons: { ingress: { enabled: true } } };
+    expect(() => parseConfig(partial)).toThrow(/addons\.externalDns/);
+  });
+
+  test('fixture：开启 Web 入口，不开 ExternalDNS', () => {
+    expect(fixture().addons).toEqual({ ingress: { enabled: true }, externalDns: { enabled: false, hostedZones: [] } });
+  });
+
+  test('开启 ExternalDNS：需要 ingress 和至少一个托管区域', () => {
+    expect(withDns({ enabled: true, hostedZones: [ZONE] }).addons.externalDns.hostedZones).toEqual([ZONE]);
+    expect(() => withDns({ enabled: true, hostedZones: [] })).toThrow(
+      /addons\.externalDns\.hostedZones: 开启 ExternalDNS 时至少要列出一个托管区域/,
+    );
+    expect(() => withDns({ enabled: true, hostedZones: [ZONE] }, false)).toThrow(
+      /addons\.externalDns\.enabled: 开启 ExternalDNS 时必须同时开启 addons\.ingress/,
+    );
+  });
+
+  test.each(['z0123456789', 'Z', 'Z0123-456', '/hostedzone/Z0123456789', `Z${'1'.repeat(33)}`])(
+    '拒绝非法的托管区域 ID %s',
+    (id) => {
+      expect(() => withDns({ enabled: true, hostedZones: [{ ...ZONE, id }] })).toThrow(
+        /addons\.externalDns\.hostedZones\.0\.id: 不是合法的 Route 53 托管区域 ID/,
+      );
+    },
+  );
+
+  test.each(['Example.com', 'example.com.', 'localhost', '-bad.example.com', 'a..b.com', 'under_score.com'])(
+    '拒绝不合法的域名 %s',
+    (name) => {
+      expect(() => withDns({ enabled: true, hostedZones: [{ ...ZONE, name }] })).toThrow(
+        /addons\.externalDns\.hostedZones\.0\.name: 应该是小写域名/,
+      );
+    },
+  );
+
+  test('托管区域最多 10 个，ID 不能重复', () => {
+    const zones = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `Z${String(i).padStart(10, '0')}`, name: `d${i}.example.com` }));
+    expect(() => withDns({ enabled: true, hostedZones: zones(10) })).not.toThrow();
+    expect(() => withDns({ enabled: true, hostedZones: zones(11) })).toThrow(/addons\.externalDns\.hostedZones/);
+    const duplicated = [ZONE, { ...ZONE, name: 'other.com' }];
+    expect(() => withDns({ enabled: true, hostedZones: duplicated })).toThrow(/托管区域 ID 不能重复/);
+    // 没开 ExternalDNS 时列表不会被使用，不做检查
+    expect(() => withDns({ enabled: false, hostedZones: duplicated })).not.toThrow();
   });
 });

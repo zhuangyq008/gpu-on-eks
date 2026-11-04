@@ -32,8 +32,6 @@ REQUIRED_ACTIONS: Tuple[str, ...] = (
     "cloudformation:CreateStack",
     "iam:CreateRole",
     "iam:PassRole",
-    "codebuild:CreateProject",
-    "codebuild:StartBuild",
     "s3:CreateBucket",
     "ssm:PutParameter",
     "eks:CreateCluster",
@@ -337,19 +335,28 @@ def _cdk_bootstrap(gw: AwsGateway) -> Tuple[bool, Checks]:
 
 
 def _existing_deployment(gw: AwsGateway, name: str) -> Tuple[bool, Checks]:
-    stack = f"{name}-bootstrap"
+    """EKS 栈和网络栈任一个存在就算已有部署：首次部署可能在网络栈建好、EKS 栈还没建（或回滚）时中断。
+
+    两个栈都要看状态：EKS 栈正常、网络栈卡在 UPDATE_ROLLBACK_FAILED 时，--update 一样会失败。"""
     try:
-        status = gw.stack_status(stack)
+        found = [(s, gw.stack_status(s)) for s in (f"{name}-eks", f"{name}-network")]
     except GatewayError as exc:
         return False, (Check(WARN, "无法检查是否已有同名部署", str(exc)),)
-    if status is None:
+    present = [(s, st) for s, st in found if st is not None]
+    if not present:
         return False, ()
+    # 任一个栈损坏或者正在变更，都要先处理；都正常时按 EKS 栈报告
+    stack, status = next(
+        ((s, st) for s, st in present if st in BROKEN_STACK_STATES or st.endswith("_IN_PROGRESS")), present[0]
+    )
     if status in BROKEN_STACK_STATES:
-        detail = f"栈 {stack} 无法更新，请先删除（./qwenctl destroy --name {name}），或者换一个部署名称"
+        detail = f"栈 {stack} 无法更新，请先按 docs/04 §5.6 清理，或者换一个部署名称（--name）"
         return True, (Check(FAIL, f"已存在名为 {name} 的部署，但状态是 {status}", detail),)
     if status.endswith("_IN_PROGRESS"):
         return True, (Check(FAIL, f"名为 {name} 的部署正在变更中（{status}）", "请等它完成后再运行"),)
-    return True, (Check(INFO, f"已存在名为 {name} 的部署 → 本次将更新它"),)
+    return True, (
+        Check(INFO, f"已存在名为 {name} 的部署", "更新请用 ./qwenctl deploy --update，断线续跑用 --resume"),
+    )
 
 
 def _permissions(gw: AwsGateway, principal: str) -> Checks:

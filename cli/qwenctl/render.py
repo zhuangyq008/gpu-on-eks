@@ -37,6 +37,8 @@ def summary_lines(config: DeploymentConfig, report: PreflightReport) -> List[str
         f"  异步通道      {'启用' if a.features.async_channel else '不启用'}",
         f"  Bedrock 溢出  {'启用' if a.features.bedrock_overflow else '不启用'}",
         f"  告警邮箱      {a.features.alert_email or '不发送'}",
+        f"  Web 应用入口  {'启用（AWS Load Balancer Controller + WAF）' if a.features.web_ingress else '不启用'}",
+        f"  ExternalDNS   {('、'.join(z.name for z in a.features.dns_zones)) if a.features.dns_zones else '不启用'}",
         f"  可观测性      {'Grafana（AMG）' if config.observability_mode == 'grafana' else 'CloudWatch'}",
     ]
     return lines + _cost_lines(config, report)

@@ -387,3 +387,36 @@ def test_region_falls_back_to_aws_region_env(monkeypatch):
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     monkeypatch.setenv("AWS_REGION", "ap-southeast-5")
     assert Boto3Gateway().region() == "ap-southeast-5"
+
+
+def test_public_hosted_zones_skip_private_zones_and_strip_prefixes():
+    route53 = _client(
+        pages={
+            "list_hosted_zones": [
+                {
+                    "HostedZones": [
+                        {
+                            "Id": "/hostedzone/Z01ABCDEFGHIJ",
+                            "Name": "app.example.com.",
+                            "Config": {"PrivateZone": False},
+                        },
+                        {
+                            "Id": "/hostedzone/Z02PRIVATE",
+                            "Name": "internal.example.",
+                            "Config": {"PrivateZone": True},
+                        },
+                        {"Id": "/hostedzone/Z03NOCONFIG", "Name": "other.example.com."},
+                    ]
+                }
+            ]
+        }
+    )
+    zones = _gw(route53=route53).public_hosted_zones()
+    assert [(z.zone_id, z.name) for z in zones] == [
+        ("Z01ABCDEFGHIJ", "app.example.com"),
+        ("Z03NOCONFIG", "other.example.com"),
+    ]
+    broken = MagicMock()
+    broken.get_paginator.side_effect = _client_error("AccessDenied")
+    with pytest.raises(GatewayError, match="无法列出 Route 53 托管区域"):
+        _gw(route53=broken).public_hosted_zones()

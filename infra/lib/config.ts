@@ -119,6 +119,45 @@ const networkSchema = z.object({
   }),
 });
 
+/** 小写域名，至少两级，结尾不带点（Route 53 返回的区域名带点，qwenctl 写配置时去掉） */
+const DOMAIN_NAME =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+/** ExternalDNS 的 IAM 策略逐个列出区域 ARN，限制数量让策略大小可控 */
+export const MAX_HOSTED_ZONES = 10;
+
+const hostedZoneSchema = z.object({
+  id: z
+    .string()
+    .regex(/^Z[0-9A-Z]{1,32}$/, "不是合法的 Route 53 托管区域 ID（例如 Z0123456789ABC）"),
+  name: z
+    .string()
+    .max(253)
+    .regex(DOMAIN_NAME, "应该是小写域名，结尾不带点（例如 example.com）"),
+});
+
+/** 客户 Web 应用的集群插件。整段可选：旧版 qwenctl 生成的配置没有这个字段 */
+const addonsSchema = z
+  .object({
+    // AWS Load Balancer Controller 的 IAM 角色 + WAF WebACL（控制器本身由 qwenctl 用 Helm 安装）
+    ingress: z.object({ enabled: z.boolean() }),
+    externalDns: z.object({
+      enabled: z.boolean(),
+      hostedZones: z.array(hostedZoneSchema).max(MAX_HOSTED_ZONES),
+    }),
+  })
+  // 每次返回新对象，解析结果之间不共享
+  .default(() => ({
+    ingress: { enabled: false },
+    externalDns: { enabled: false, hostedZones: [] },
+  }));
+
+/**
+ * 只接受密钥 ARN，不接受 alias：KMS 授权（EBS CSI 的 CreateGrant）和 IAM 策略的 Resource 都按密钥 ARN 匹配，
+ * 用 alias 的话角色会拿不到这把 key 的权限。密钥 ID 是 UUID，多 region 密钥是 mrk- 加 32 位十六进制。
+ */
+const KMS_KEY_ARN =
+  /^arn:aws[a-z-]*:kms:[a-z]{2}(-[a-z]+)+-\d:\d{12}:key\/(?:mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
 /** 只校验 CDK 用到的高级配置；其余字段原样保留（后续的栈会用到） */
 const advancedSchema = z.looseObject({
   network: z.looseObject({
@@ -137,7 +176,10 @@ const advancedSchema = z.looseObject({
   compliance: z.looseObject({
     kms_key_arn: z
       .string()
-      .regex(/^arn:aws[a-z-]*:kms:/, "不是 KMS 密钥 ARN")
+      .regex(
+        KMS_KEY_ARN,
+        "应该是 KMS 密钥 ARN（arn:aws:kms:<region>:<账号>:key/<密钥 ID>），不能用别名",
+      )
       .nullable(),
     tags: z.record(z.string(), z.string()),
     extra_admin_role_arns: z.array(
@@ -189,6 +231,7 @@ export const configSchema = z
     }),
     observability: z.object({ mode: z.enum(["cloudwatch", "grafana"]) }),
     serving: servingSchema,
+    addons: addonsSchema,
     advanced: advancedSchema,
   })
   .superRefine((cfg, ctx) => {
@@ -198,6 +241,7 @@ export const configSchema = z
       issue(["gpu", "maxReplicas"], "不能小于 minReplicas");
     }
     checkAccess(cfg.access, issue);
+    checkAddons(cfg.addons, issue);
     if (cfg.network.mode === "new") {
       checkNewNetwork(cfg.network, issue);
     } else {
@@ -217,6 +261,26 @@ function checkAccess(access: DeploymentConfig["access"], issue: Issue): void {
       ["access", "allowedCidrs"],
       "公网访问必须限定来源 CIDR，或者明确确认 openToInternet",
     );
+  }
+}
+
+function checkAddons(addons: DeploymentConfig["addons"], issue: Issue): void {
+  if (!addons.externalDns.enabled) return;
+  const zonesPath = ["addons", "externalDns", "hostedZones"];
+  const ids = addons.externalDns.hostedZones.map((z) => z.id);
+  if (new Set(ids).size !== ids.length) {
+    // 每个 ID 对应一个 --zone-id-filter 参数，add-on 的 schema 要求 extraArgs 不重复
+    issue(zonesPath, "托管区域 ID 不能重复");
+  }
+  if (!addons.ingress.enabled) {
+    // ExternalDNS 把 Ingress / Service 的负载均衡器地址写进 Route 53，没有控制器就没有地址
+    issue(
+      ["addons", "externalDns", "enabled"],
+      "开启 ExternalDNS 时必须同时开启 addons.ingress（AWS Load Balancer Controller）",
+    );
+  }
+  if (ids.length === 0) {
+    issue(zonesPath, "开启 ExternalDNS 时至少要列出一个托管区域");
   }
 }
 

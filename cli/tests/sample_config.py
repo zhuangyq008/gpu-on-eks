@@ -43,7 +43,7 @@ _GATEWAYS: Dict[str, FakeGateway] = {
     ),
 }
 # existing：选现有 VPC → 选第 1 个 VPC → 仅内部访问 → 其余默认 → 确认
-_ANSWERS: Dict[str, Tuple[str, ...]] = {"new": (), "existing": ("2", "1", "1", "", "", "", "", "y")}
+_ANSWERS: Dict[str, Tuple[str, ...]] = {"new": (), "existing": ("2", "1", "1", "", "", "", "", "", "y")}
 
 
 def generate(mode: str) -> str:

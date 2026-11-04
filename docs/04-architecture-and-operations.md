@@ -21,7 +21,9 @@
 | 按负载自动扩缩容 + 主力机型没货时自动回退 | ✅ | KEDA + Karpenter（§4） |
 | 冷启动优化（NVMe、SOCI 并行拉取、S3 流式加载权重、S3 编译缓存） | ✅ | 新节点扩容约 3 分 40 秒（§3） |
 | 客户的非 GPU 业务共用集群 | ✅ | 不加任何设置就落到通用 CPU 节点池（§4.7） |
-| 网关（internal ALB + API Key）、NetworkPolicy | ⏳ 计划中 | **交付生产前必须完成** |
+| 客户 Web 应用对外提供服务：ALB Ingress / NLB + WAF；可选 ExternalDNS | ✅ 部署时可选 | §5.8 |
+| HPA（metrics-server）、持久卷（EBS CSI + 加密的 gp3 默认 StorageClass） | ✅ | 始终安装，§5.8 |
+| 推理 API 网关（API Key、限流、校验）、NetworkPolicy | ⏳ 计划中 | **推理 API 对集群外开放前必须完成**；生产清单见 [06](06-production-checklist.md) |
 | 可观测性：CloudWatch 面板、告警、容器日志集中采集 | ⏳ 计划中 | 现在能用的手段见 §6 |
 | `status`、`test`、`scale`、`destroy` 等运维命令 | ⏳ 计划中 | 临时做法见 §5 |
 | 部署时提问的「访问方式」和「可选能力（异步通道 / Bedrock 溢出 / 告警邮箱）」 | ⏳ 已保存，基本不生效 | 网关和可观测性阶段接入。目前只有「异步通道」会影响是否创建 sqs 接口终端节点 |
@@ -74,6 +76,9 @@ flowchart LR
 | Helm（kube-system） | Karpenter 1.15.1 |
 | Helm（monitoring） | kube-prometheus-stack 92.17.1 精简版：Prometheus（保留 6 小时）、kube-state-metrics、operator |
 | Helm（keda） | KEDA 2.21.0 |
+| EKS 托管 add-on（集群插件） | metrics-server、aws-ebs-csi-driver（Pod Identity）；选了 ExternalDNS 时还有 external-dns（Pod Identity，权限只限所选的托管区域） |
+| Helm（kube-system，选了 Web 应用入口时） | AWS Load Balancer Controller 3.6.2（2 副本、PDB，跑在系统节点；IAM 在 EKS 栈里，以上游策略为基础按 region / 账号 / VPC 收紧）；WAF WebACL 在 EKS 栈里 |
+| K8s（集群级，插件） | 默认 StorageClass `gp3`（加密）；选了 Web 应用入口时有 IngressClass `alb` |
 | K8s（集群级） | EC2NodeClass `general`、`gpu`；NodePool `general`、`gpu-<profile>` |
 | K8s（命名空间 `qwen-vl`） | Deployment `vllm-<profile>`、Service `qwen-vl`、ScaledObject `vllm-<profile>`、PodMonitor `vllm`、权重同步 Job、编译缓存恢复脚本 ConfigMap |
 | 客户端 `~/.qwenctl/qwen-vl/` | 部署配置 `config.json`、进度 `state.json`、kubeconfig、Helm values（只有本人可读写）。**这是更新和续跑用的唯一一份配置，请备份**（§5.1） |
@@ -84,7 +89,7 @@ flowchart LR
 
 | 节点 | 管理方式 | 机型 | 污点 | 运行什么 |
 |---|---|---|---|---|
-| 系统节点 | EKS 托管节点组，固定 2 台（每个 AZ 1 台） | m7g.large（Graviton） | `CriticalAddonsOnly` | Karpenter、KEDA、Prometheus、CoreDNS 等插件 |
+| 系统节点 | EKS 托管节点组，固定 2 台（每个 AZ 1 台） | m7g.large（Graviton） | `CriticalAddonsOnly` | Karpenter、KEDA、Prometheus、CoreDNS、metrics-server、EBS CSI 控制器、AWS Load Balancer Controller、ExternalDNS 等插件 |
 | 通用 CPU 节点 | Karpenter NodePool `general` | c / m / r 系列第 6 代及以上，x86，按需实例，vCPU 合计上限 200 | 无 | **客户的非 GPU 业务**、权重同步 Job |
 | GPU 节点 | Karpenter NodePool `gpu-<profile>`，每个 GPU profile 一个 | 见 §4.2 | `nvidia.com/gpu` | 只有 vLLM |
 
@@ -308,7 +313,7 @@ export KUBECONFIG=~/.qwenctl/qwen-vl/kubeconfig
 ```
 
 - CloudShell 空闲 20~30 分钟会断开，但 CloudFormation 会在服务端继续执行。重新打开后运行 `--resume` 即可。
-- ⚠️ **已经部署过的，只用 `--resume` 或 `--update`**。不带这两个参数再次运行 `deploy`（包括 `--yes`），会重新提问或者全部取默认值，然后**覆盖** `config.json`；如果还加了 `--approve`，会按新的回答重新部署，例如把现有 VPC 换成新建 VPC、把副本数改回默认值。当前版本还不能识别「已有同名部署」，这是已知问题（§7）。
+- **已经部署过的，只用 `--resume` 或 `--update`**。对已有部署再次运行不带这两个参数的 `deploy`（包括 `--yes`），qwenctl 会直接拒绝：重新提问会覆盖保存的 `config.json`。只想看看新的配置，可以用 `--plan --output <另一个路径>`。
 - **备份 `~/.qwenctl/qwen-vl/config.json`**：这是更新和续跑用的唯一一份配置。CloudShell 的 home 目录虽然会保留，但只有 1 GB、只属于当前用户，而且 **120 天没有使用 CloudShell 就会被清除**。
 - **换一个人或换一台机器操作**：
   1. 把交付包和 `config.json` 复制到对方的同一路径下。
@@ -437,6 +442,139 @@ aws cloudformation describe-stacks --region $REGION \
 - **GPU profile 的参数不会自动更新**：保存的配置里已有的 profile 参数（`cSla`、`servingLimits`、`podCpu` / `podMemory` 等）会原样保留，新版机型目录里的新值只用来补齐缺失的字段。要用新值，请对照新版的 `cli/qwenctl/catalog.py` 手动修改 `config.json`。
 - **Bottlerocket 版本变化会替换全部节点**：EC2NodeClass 变了，Karpenter 会把所有节点（包括 GPU 节点）换成新 AMI 的节点。GPU 副本要在新节点上冷启动，也可能遇到 ICE，请在低峰期升级。
 - **vLLM 镜像、模型或推理参数变化**：vLLM 会滚动重启（中断说明见 §1.3）；编译缓存的 key 会变，第一个副本会重新编译，这次 `--update` 结束时自动保存新缓存。
+
+### 5.8 部署客户 Web 应用并对外提供服务
+
+部署时第 4 个问题里选了「Web 应用入口」，集群里就有 AWS Load Balancer Controller 和一个 WAF WebACL。下面这些能力不管选没选，都会安装：
+- metrics-server：HPA 按 CPU / 内存扩缩容，`kubectl top` 也能用；
+- EBS CSI 驱动 + 默认 StorageClass `gp3`：加密、可扩容、按 Pod 所在 AZ 建卷。
+
+**公网 HTTPS（ALB Ingress）**：证书要先在 ACM 里签发或导入，并且和集群在同一个 region。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: my-app}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: web
+        image: <镜像，生产建议用 digest 引用>
+        ports: [{containerPort: 8080}]
+        resources: {requests: {cpu: 250m, memory: 256Mi}}   # Karpenter 按 requests 选机型
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: my-app}
+spec:
+  selector: {app: web}
+  ports: [{port: 80, targetPort: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: my-app
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing          # 内网用 internal
+    alb.ingress.kubernetes.io/target-type: ip                  # 直接转发到 Pod
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: <ACM 证书 ARN>
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/wafv2-acl-arn: <WAF WebACL ARN，部署完成时打印，也在 EKS 栈输出 WebAclArn 里>
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true
+    alb.ingress.kubernetes.io/group.name: my-app               # 多个 Ingress 共用一个 ALB 时用同一个组名
+spec:
+  ingressClassName: alb
+  rules:
+  - host: www.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}
+```
+
+```bash
+kubectl -n my-app get ingress web     # ADDRESS 一栏就是 ALB 的 DNS 名，创建大约需要 2~3 分钟
+```
+
+- **WAF 是强制的**：公网（`internet-facing`）Ingress 不带 `wafv2-acl-arn` 注解、或者注解值不是本账号、本 region 的 WAFv2 WebACL ARN，集群会直接拒绝（见下面的准入策略）。只支持 WAFv2；旧的 `waf-acl-id` 注解（WAF Classic）在马来西亚没有服务，不要用。这个 WebACL 包含：
+  - AWS 托管的通用规则、已知恶意输入、IP 信誉、SQL 注入四组规则；
+  - 每个 IP 5 分钟 2000 次请求的限速。
+  - 规则命中情况在 CloudWatch 的 WAF 指标里看。上线后先观察一段时间的拦截情况，确认没有误拦。
+  - ⚠️ **超过 8 KB 的请求体，WAF 只检查前 8 KB**。通用规则里「请求体超过 8 KB 就拦截」那一条已经改成只计数，因为 Web 应用经常要上传图片。代价是：攻击者在请求体前面垫 8 KB 数据，就能绕过所有针对请求体的规则。所以**应用自己必须校验输入**，不能只依赖 WAF。不需要上传的应用，可以为它单独建一个不改这条规则的 WebACL。
+- **集群里的两条准入策略**（ValidatingAdmissionPolicy，在 API server 内部求值，不依赖控制器是否在线）：
+  - `qwenctl-public-alb-waf`：
+    - 公网 Ingress 必须带 `wafv2-acl-arn` 注解，值必须是本账号、本 region 的 WAFv2 WebACL ARN（`arn:aws:wafv2:<region>:<账号>:regional/webacl/...`）。空值、`none`、别的账号或别的 region 的 ARN 都会被拒；
+    - ⚠️ 准入策略**查不到这个 WebACL 是否真的存在**。实测：ARN 格式正确、但 WebACL 不存在（比如复制时改错了一位）时，控制器**照样建出公网 ALB，监听器也在转发流量，只是没有挂上 WAF**；控制器不断重试关联 WAF，Ingress 上一直拿不到地址。所以 Ingress 建好后请确认：
+      ```bash
+      kubectl -n <命名空间> get ingress <名字>          # ADDRESS 一栏有地址才算部署成功
+      kubectl -n <命名空间> describe ingress <名字>     # 有 FailedDeployModel ... AssociateWebACL 就是 ARN 写错了
+      ```
+      发现写错后，改正注解就行（控制器会自动重新关联）；或者直接删掉这个 Ingress。
+    - 只能用 `spec.ingressClassName: alb`，不能用旧的 `kubernetes.io/ingress.class: alb` 注解：旧注解不经过 IngressClassParams，下面的命名空间限制会失效。
+  - `qwenctl-lb-service-class`：
+    - `type: LoadBalancer` 的 Service 必须写 `loadBalancerClass`（见下面的 NLB）。EKS 自带的旧版控制器不处理写了 `loadBalancerClass` 的 Service，所以写了别的值也不会建出 Classic LB；
+    - 系统命名空间（`kube-system` 等）、`keda`、`monitoring`、`external-dns` 和推理命名空间（`qwen-vl`）里不能建 `type: LoadBalancer` 的 Service。
+  - 另外，`alb` 这个 IngressClass 不允许在上面这些命名空间里使用（IngressClassParams 的 `namespaceSelector`）。推理服务和 Prometheus 没有认证，不能被发布出去。
+  - 正在删除的对象不检查：策略生效（或收紧）之前就建好的不合规 Ingress / Service，删除时控制器要更新对象、摘掉 finalizer，不能被拦住。
+  - ⚠️ 这些护栏**防误操作，不防有意绕过**：有 cluster-admin 权限的人可以直接删掉准入策略。给客户开发团队的权限请按命名空间授权（RBAC），不要给 cluster-admin。
+- **DNS**：
+  - 部署时选了 ExternalDNS：Ingress 里写的 `host` 会自动在所选的 Route 53 托管区域里建记录。ExternalDNS 只增不删，删 Ingress 不会删记录。
+  - 没选 ExternalDNS：在客户自己的 DNS 上，把域名 CNAME 到 ALB 的 DNS 名。
+- **NLB（四层，Service type=LoadBalancer）**：必须写 `loadBalancerClass: service.k8s.aws/nlb`（准入策略会检查）。不写的话会落到 EKS 自带的旧版控制器，建出**默认对公网开放**、没有安全组、也挂不了 WAF 的 Classic LB。默认用内网 NLB：
+
+  ```yaml
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: web-nlb
+    namespace: my-app
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internal          # 公网改 internet-facing，并且一定要限制来源
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+  spec:
+    type: LoadBalancer
+    loadBalancerClass: service.k8s.aws/nlb
+    loadBalancerSourceRanges: [10.0.0.0/8]                                     # 允许访问的来源网段
+    selector: {app: web}
+    ports: [{port: 80, targetPort: 8080}]
+  ```
+
+  NLB 挂不了 WAF。公网的 HTTP(S) 服务请用 ALB Ingress；公网 NLB 只用于非 HTTP 协议，并且必须写 `loadBalancerSourceRanges`。
+  控制器自带一个 Service webhook，默认对集群里所有 Service 生效，并且失败就拒绝。控制器不可用时，任何 Service 都建不了，所以我们把它关掉了，改用上面的准入策略。
+- **HPA**：
+
+  ```bash
+  kubectl -n my-app autoscale deployment web --cpu-percent=60 --min=2 --max=10
+  kubectl -n my-app get hpa     # TARGETS 显示 CPU 百分比，说明 metrics-server 正常
+  ```
+
+  HPA 扩出来的 Pod 放不下时，Karpenter 会在通用节点池拉起节点（§4.7）。
+- **持久卷**：PVC 不写 `storageClassName` 就用默认的 `gp3`。配置了客户 CMK 时，卷用这个 CMK 加密：CMK 的 key policy 要允许 EBS CSI 驱动的 IAM 角色使用这个 key，否则 PVC 会一直卡在创建中。卷建在 Pod 被调度到的 AZ，之后 Pod 只能调度回这个 AZ。需要多 AZ 共享的数据，请用 S3 或 EFS（EFS CSI 驱动目前没有装）。
+
+  ```yaml
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata: {name: data, namespace: my-app}
+  spec:
+    accessModes: [ReadWriteOnce]
+    resources: {requests: {storage: 20Gi}}
+  ```
+
+- **部署之后再启用**：已有部署想加上 Web 应用入口（或 ExternalDNS），把 `~/.qwenctl/qwen-vl/config.json` 里的 `addons.ingress.enabled` 改成 `true`，再运行 `./qwenctl deploy --update`。ExternalDNS 还要在 `addons.externalDns.hostedZones` 里填 `{"id": "Z...", "name": "example.com"}`，并把 `addons.externalDns.enabled` 改成 `true`。
+- **关掉**（顺序不能反）：
+  1. 删掉所有 Ingress 和 `loadBalancerClass: service.k8s.aws/nlb` 的 Service，等控制器把对应的 ALB / NLB 删干净（`kubectl get ingress,svc -A` 里没有这些对象，EC2 控制台里也没有这些负载均衡器）。
+  2. `helm -n kube-system uninstall aws-load-balancer-controller`。
+  3. 把 `addons.ingress.enabled` 改回 `false`，运行 `--update`：删除控制器的 IAM 角色和 WAF，以及集群里的两条准入策略（不删的话，策略的报错提示会让人去写一个已经不存在的控制器的 class）。如果第 2 步还没做，`--update` 会提示「还装着 aws-load-balancer-controller」，但不会自动卸载。
+
+  如果先删了 IAM 角色，控制器就没有权限清理负载均衡器，ALB / NLB 会遗留下来，并且继续计费。
 
 ---
 
@@ -599,9 +737,8 @@ kubectl describe node <节点名> | sed -n '/Conditions/,/Addresses/p'
 | 配置备份 | 只在客户端 `~/.qwenctl/` 下 | 存到 S3（带版本）和 SSM |
 
 **部署工具的已知问题**（下一版修复）：
-- 环境检查会检查 `codebuild:CreateProject` / `codebuild:StartBuild`、`s3:CreateBucket`、`ssm:PutParameter` 权限。这是早期设计（CodeBuild）留下的，实际不需要。没有这些权限的账号，环境检查会失败。
-- 「已有同名部署」的检测查错了栈名，检测不到已有部署。所以对已有部署再次运行 `deploy` 会覆盖配置（§5.1）。
-- 部署过程中的部分提示和实际情况不一致：确认页写「首次约 20 分钟」，实际约 30~40 分钟（含权重同步）；提示里提到的 `./qwenctl test` 和 `./qwenctl destroy` 还没有实现。
+- 部署过程中的部分提示和实际情况不一致：确认页写「首次约 20 分钟」，实际约 30~40 分钟（含权重同步）；提示里提到的 `./qwenctl test` 还没有实现。
+- 已修复：环境检查不再要求用不到的 CodeBuild 权限；已有同名部署时，`deploy` 会直接拒绝并提示改用 `--update` / `--resume`，不会再覆盖保存的配置。
 
 **成本**：GPU 部分的估算见 [01 §11](01-architecture-design.md#11-成本估算gpu-部分730-h月)。注意主力和回退各自最多 maxReplicas 个副本，主力没货、回退打满时，成本按回退机型算（g6.12xlarge 每副本约 $2.90/h）。
 

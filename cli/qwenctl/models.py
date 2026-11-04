@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .az_select import AzSelection, ProfilePlacement
+from .gateway import HostedZone
 
 SCHEMA_VERSION = 1
 
@@ -49,6 +50,10 @@ class FeatureChoice:
     async_channel: bool
     bedrock_overflow: bool
     alert_email: Optional[str] = None
+    # 客户 Web 应用的入口：AWS Load Balancer Controller（ALB Ingress / NLB）+ WAF WebACL
+    web_ingress: bool = False
+    # ExternalDNS 允许管理的 Route 53 公有托管区域；为空 = 不装 ExternalDNS
+    dns_zones: Tuple[HostedZone, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,7 @@ class DeploymentConfig:
                 "alertEmail": a.features.alert_email,
             },
             "observability": {"mode": self.observability_mode},
+            "addons": addons_section(a.features),
             "serving": serving_section(),
             "advanced": dict(self.advanced),
         }
@@ -120,6 +126,18 @@ SYNC_SERVICE_ACCOUNT = "model-sync"
 MODEL_PREFIX = "models/"
 # vLLM 编译缓存（torch.compile / Triton 产物）。vLLM 只读，由 qwenctl 写入（见 compile_cache.py）
 COMPILE_CACHE_PREFIX = "compile-cache/"
+
+
+def addons_section(features: Optional[FeatureChoice] = None) -> Dict[str, Any]:
+    """集群插件的选择。没有 features（旧版本保存的配置）时全部关闭：升级不会悄悄改动客户的集群。"""
+    zones = features.dns_zones if features else ()
+    return {
+        "ingress": {"enabled": bool(features and features.web_ingress)},
+        "externalDns": {
+            "enabled": bool(zones),
+            "hostedZones": [{"id": z.zone_id, "name": z.name} for z in zones],
+        },
+    }
 
 
 def serving_section() -> Dict[str, Any]:
@@ -157,6 +175,7 @@ def migrate_config(data: Mapping[str, Any]) -> Dict[str, Any]:
         **data,
         "gpu": {**gpu, "profiles": profiles},
         "serving": {**serving_section(), **dict(data.get("serving") or {})},
+        "addons": data.get("addons") or addons_section(),
         # 新版本新增的高级配置项用默认值补上；客户已有的值优先
         "advanced": deep_merge(DEFAULTS, data.get("advanced") or {}),
     }
