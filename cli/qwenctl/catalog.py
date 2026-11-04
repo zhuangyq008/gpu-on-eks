@@ -11,6 +11,8 @@ from typing import Optional, Tuple
 
 # 没有压测数据时，单副本在 SLA 内的并发占位值
 DEFAULT_C_SLA = 24
+# 每个 GPU profile 的副本数封顶（提问时还会按 G/VT 配额再收紧）；保存的配置超过它视为被篡改
+MAX_GPU_REPLICAS = 256
 
 
 @dataclass(frozen=True)

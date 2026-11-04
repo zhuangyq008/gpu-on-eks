@@ -9,7 +9,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from .az_select import AzSelection, AzSelectionError, select_azs
 from .capacity import estimate_cost, replica_defaults
-from .catalog import GPU_QUOTA_CODE, PROFILES
+from .catalog import GPU_QUOTA_CODE, MAX_GPU_REPLICAS, PROFILES
 from .console import Aborted, Console
 from .gateway import AwsGateway, EndpointServices, GatewayError
 from .models import AccessChoice, Answers, CapacityChoice, FeatureChoice, NetworkChoice, SubnetRef
@@ -219,7 +219,7 @@ def validate_cidrs(raw: str) -> Optional[str]:
 # ---- 3. 副本数 ----
 def ask_capacity(console: Console, report: PreflightReport, selection: AzSelection) -> CapacityChoice:
     profile = selection.primary.profile
-    upper = report.upper_bound_for(selection)
+    upper = min(report.upper_bound_for(selection), MAX_GPU_REPLICAS)
     if upper < 1:
         raise ValueError(f"G/VT 配额不足以启动 1 个 {profile.instance_type} 副本")
     defaults = replica_defaults(upper)

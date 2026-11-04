@@ -183,3 +183,19 @@ def test_broken_cdk_toolkit_warns(gw):
     report = _run(replace(gw, stacks={"CDKToolkit": "UPDATE_ROLLBACK_FAILED"}))
     assert report.cdk_bootstrapped
     assert any("UPDATE_ROLLBACK_FAILED" in t for t in _titles(report, WARN))
+
+
+def test_replica_question_is_capped_like_saved_config_validation():
+    """配额很大时提问上限也不超过 MAX_GPU_REPLICAS，否则保存的配置之后 --resume 会被拒绝。"""
+    from qwenctl.catalog import MAX_GPU_REPLICAS
+    from qwenctl.questions import ask_capacity
+
+    from .conftest import make_console
+
+    huge = FakeGateway(quotas={"L-DB2E81BA": 100_000.0, "L-1216C47A": 1152.0})
+    report = _run(huge)
+    assert report.upper_bound_for(report.selection) > MAX_GPU_REPLICAS
+    con, out = make_console(assume_defaults=True)
+    choice = ask_capacity(con, report, report.selection)
+    assert f"上限 {MAX_GPU_REPLICAS}" in out.getvalue()
+    assert choice.max_replicas <= MAX_GPU_REPLICAS

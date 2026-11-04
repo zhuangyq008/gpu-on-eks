@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from . import __version__
 from .advanced import C_SLA_RANGE, ConfigError, load_advanced, validate
+from .autoscaling import scaled_objects
+from .catalog import MAX_GPU_REPLICAS
 from .console import Aborted, Console
 from .endpoints import plan_endpoints, wanted_interface_endpoints
 from .gateway import AwsGateway, GatewayError
@@ -224,6 +226,7 @@ def _deploy(
         endpoints=endpoints,
         advanced=advanced,
     )
+    _check_scaling(config.to_dict())
     con.heading("[3/3] 确认")
     for line in summary_lines(config, report):
         con.line(line)
@@ -266,6 +269,7 @@ def _resume(con: Console, gw: AwsGateway, args: argparse.Namespace, install: Ins
     _validate_saved_config(config, gw)
     migrated = migrate_config(config)
     validate(migrated["advanced"])  # 手改过的高级配置也要重新校验
+    _check_scaling(migrated)
     if migrated != config:
         write_private(path, json.dumps(migrated, ensure_ascii=False, indent=2) + "\n")
         con.status("info", "已为保存的配置补上新版本新增的字段（不改变你的选择）")
@@ -283,8 +287,15 @@ def _resume(con: Console, gw: AwsGateway, args: argparse.Namespace, install: Ins
 _ACCOUNT = re.compile(r"^\d{12}$")
 _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
 _PREFIX = re.compile(r"^[a-z0-9][a-z0-9._-]*/$")
-# 只是防篡改的上限；实际上限在提问时按 G/VT 配额算
-MAX_GPU_REPLICAS = 256
+
+
+def _check_scaling(config: Mapping[str, Any]) -> None:
+    """扩缩容配置（比如 advanced.scaling.c_sla 里的 profile 名）要到最后的 serving 阶段才用到：
+    在安装开始前先生成一次，写错了马上报，而不是等十几分钟之后。"""
+    try:
+        scaled_objects(config)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _validate_saved_names(config: Mapping[str, Any]) -> None:

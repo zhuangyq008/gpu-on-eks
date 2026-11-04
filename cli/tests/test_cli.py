@@ -359,3 +359,18 @@ def test_resume_rejects_tampered_gpu_numbers(gw, tmp_path, monkeypatch, tamper):
     con, out = make_console()
     assert main(["deploy", "--resume"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
     assert "GPU 副本数或 profile 参数不对" in out.getvalue()
+
+
+def test_resume_rejects_c_sla_for_unknown_profile_before_installing(gw, tmp_path, monkeypatch):
+    """扩缩容配置写错要在安装开始前报，而不是等到最后的 serving 阶段。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["advanced"]["scaling"]["c_sla"] = {"g7e-1gpus": 40}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    install = RecordingInstall()
+    con, out = make_console()
+    assert main(["deploy", "--update"], _factory(gw), con, install) == EXIT_CONFIG_ERROR
+    assert install.requests == [] and "g7e-1gpus" in out.getvalue()
