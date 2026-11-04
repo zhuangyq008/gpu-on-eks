@@ -55,7 +55,9 @@
         "experimental": false,
         "zoneIds": [
           "apse5-az2"
-        ]
+        ],
+        "podCpu": "6",
+        "podMemory": "48Gi"
       },
       {
         "name": "g6-tp2",
@@ -69,7 +71,9 @@
         "zoneIds": [
           "apse5-az1",
           "apse5-az2"
-        ]
+        ],
+        "podCpu": "20",
+        "podMemory": "88Gi"
       }
     ]
   },
@@ -83,6 +87,12 @@
   },
   "observability": {
     "mode": "cloudwatch"
+  },
+  "serving": {
+    "namespace": "qwen-vl",
+    "vllmServiceAccount": "vllm",
+    "syncServiceAccount": "model-sync",
+    "modelPrefix": "models/"
   },
   "advanced": {
     "serving": {

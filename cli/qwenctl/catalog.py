@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,13 @@ class GpuProfile:
     experimental: bool = False
     extra_instance_types: Tuple[str, ...] = ()
     note: str = ""
+    # 每个 vLLM Pod 的 CPU / 内存请求（按每节点副本数切分节点资源，留出系统预留）
+    pod_cpu: str = "6"
+    pod_memory: str = "48Gi"
+    # 显存小的 profile 需要收紧 vLLM 参数（None = 用高级配置的值）；实测依据见 docs/03 §9.1
+    max_model_len: Optional[int] = None
+    max_num_seqs: Optional[int] = None
+    max_images: Optional[int] = None
 
     @property
     def replicas_per_node(self) -> int:
@@ -78,6 +85,13 @@ PROFILES: Tuple[GpuProfile, ...] = (
         priority=1,
         experimental=True,
         note="TP=2，每个节点 2 个副本，KV 余量小",
+        pod_cpu="20",
+        pod_memory="88Gi",
+        # 2 × L4 24GB：每卡权重 17 GB；默认参数（32K、256 并发、4 张图）会在 KV cache 分配时报
+        # "No available memory for the cache blocks"（2026-11-04 实测）。下面是实测可用的组合
+        max_model_len=8192,
+        max_num_seqs=16,
+        max_images=2,
     ),
 )
 

@@ -10,6 +10,7 @@ import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { Construct } from 'constructs';
+import { podIdentityPrincipal } from './pod-identity';
 
 export const KARPENTER_NAMESPACE = 'kube-system';
 export const KARPENTER_SERVICE_ACCOUNT = 'karpenter';
@@ -49,13 +50,7 @@ export class KarpenterIam extends Construct {
     this.controllerRole = new iam.Role(this, 'ControllerRole', {
       description: `Karpenter controller of EKS cluster ${clusterName} (EKS Pod Identity)`,
       // 只允许本集群 kube-system/karpenter 这个 ServiceAccount 使用（Pod Identity 会带上这些会话 tag）
-      assumedBy: new iam.PrincipalWithConditions(new iam.ServicePrincipal('pods.eks.amazonaws.com'), {
-        StringEquals: {
-          'aws:RequestTag/eks-cluster-name': clusterName,
-          'aws:RequestTag/kubernetes-namespace': KARPENTER_NAMESPACE,
-          'aws:RequestTag/kubernetes-service-account': KARPENTER_SERVICE_ACCOUNT,
-        },
-      }).withSessionTags(),
+      assumedBy: podIdentityPrincipal(clusterName, KARPENTER_NAMESPACE, KARPENTER_SERVICE_ACCOUNT),
     });
     const documents: Record<string, Statement[]> = {
       NodeLifecycle: nodeLifecycleStatements(ctx),

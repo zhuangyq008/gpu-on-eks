@@ -17,6 +17,7 @@ from .console import Console
 from .manifests import render
 from .paths import DeploymentPaths, write_private
 from .runner import CommandError, Runner
+from .serving import base_manifests, model_prefix, sync_job, sync_job_name, vllm_deployments
 
 KARPENTER_NAMESPACE = "kube-system"
 HELM_TIMEOUT = "10m"
@@ -114,9 +115,9 @@ def _kubeconfig(ctx: InstallContext) -> None:
         os.chmod(ctx.paths.kubeconfig, 0o600)
 
 
-def eks_outputs(ctx: InstallContext) -> Dict[str, str]:
+def stack_outputs(ctx: InstallContext, suffix: str) -> Dict[str, str]:
     """以 CloudFormation 为准（outputs.json 可能是删掉重建之前的旧值）；查询失败时才用本地文件。"""
-    stack = f"{ctx.name}-eks"
+    stack = f"{ctx.name}-{suffix}"
     try:
         result = ctx.runner.run(
             ["aws", "cloudformation", "describe-stacks", "--stack-name", stack, "--region", ctx.region]
@@ -129,6 +130,10 @@ def eks_outputs(ctx: InstallContext) -> Dict[str, str]:
             raise
     with open(ctx.paths.outputs, encoding="utf-8") as handle:
         return dict(json.load(handle).get(stack, {}))
+
+
+def eks_outputs(ctx: InstallContext) -> Dict[str, str]:
+    return stack_outputs(ctx, "eks")
 
 
 def karpenter_values(name: str, region: str, interruption_queue: str) -> Dict[str, Any]:
@@ -214,12 +219,15 @@ def _kubectl(ctx: InstallContext, *args: str) -> List[str]:
     return [ctx.tools["kubectl"], "--kubeconfig", ctx.paths.kubeconfig, *args]
 
 
-def _nodepools(ctx: InstallContext) -> None:
-    manifests = render(ctx.config, eks_outputs(ctx), ctx.versions["bottlerocket"])
-    payload = json.dumps({"apiVersion": "v1", "kind": "List", "items": manifests})
+def _apply(ctx: InstallContext, manifests: Sequence[Mapping[str, Any]]) -> None:
+    payload = json.dumps({"apiVersion": "v1", "kind": "List", "items": list(manifests)})
     ctx.runner.run(
         _kubectl(ctx, "apply", "--server-side", "--field-manager", "qwenctl", "-f", "-"), input_text=payload
     )
+
+
+def _nodepools(ctx: InstallContext) -> None:
+    _apply(ctx, render(ctx.config, eks_outputs(ctx), ctx.versions["bottlerocket"]))
 
 
 def _verify(ctx: InstallContext) -> None:
@@ -235,6 +243,91 @@ def _verify(ctx: InstallContext) -> None:
     ctx.runner.run(_kubectl(ctx, "get", "nodes,nodepools", "-o", "wide"))
 
 
+# 等待时间（秒）；测试里会替换 _sleep / _now
+SYNC_TIMEOUT = 3600
+SERVING_TIMEOUT = 1500
+POLL_INTERVAL = 15
+_sleep = time.sleep
+_now = time.monotonic
+
+
+def _model_bucket(ctx: InstallContext) -> str:
+    bucket = stack_outputs(ctx, "serving").get("ModelBucketName")
+    if not bucket:
+        raise InstallError(
+            "model-sync", "推理服务栈的输出里没有 ModelBucketName，请先完成 CloudFormation 部署"
+        )
+    return bucket
+
+
+def _get_json(ctx: InstallContext, *args: str) -> Dict[str, Any]:
+    result = ctx.runner.run(_kubectl(ctx, *args, "-o", "json"), capture=True)
+    return json.loads(result.stdout or "{}")
+
+
+def _model_sync(ctx: InstallContext) -> None:
+    namespace = ctx.config["serving"]["namespace"]
+    job = sync_job_name(ctx.versions)
+    _apply(ctx, base_manifests(ctx.config) + sync_job(ctx.config, ctx.versions, _model_bucket(ctx)))
+    deadline = _now() + SYNC_TIMEOUT
+    while _now() < deadline:
+        status = _get_json(ctx, "-n", namespace, "get", "job", job).get("status", {})
+        if status.get("succeeded"):
+            ctx.console.status(
+                "ok", f"权重已同步到 s3://{_model_bucket(ctx)}/{model_prefix(ctx.config, ctx.versions)}"
+            )
+            return
+        failed = [
+            c for c in status.get("conditions", []) if c.get("type") == "Failed" and c.get("status") == "True"
+        ]
+        if failed:
+            logs = ctx.runner.run(
+                _kubectl(ctx, "-n", namespace, "logs", f"job/{job}", "--tail=20"), capture=True
+            )
+            raise InstallError("model-sync", f"权重同步失败：{failed[0].get('message', '')}\n{logs.stdout}")
+        _sleep(POLL_INTERVAL)
+    raise InstallError("model-sync", f"权重同步超过 {SYNC_TIMEOUT // 60} 分钟还没完成")
+
+
+def _pod_summary(pod: Mapping[str, Any]) -> str:
+    status = pod.get("status", {})
+    for c in status.get("containerStatuses", []):
+        waiting = c.get("state", {}).get("waiting")
+        if waiting:
+            return waiting.get("reason", "Waiting")
+        if c.get("ready"):
+            return "Ready"
+        if "running" in c.get("state", {}):
+            return "Running（加载模型中）"
+    return status.get("phase", "Unknown")
+
+
+def _serving(ctx: InstallContext) -> None:
+    namespace = ctx.config["serving"]["namespace"]
+    _apply(ctx, base_manifests(ctx.config) + vllm_deployments(ctx.config, ctx.versions, _model_bucket(ctx)))
+    started, last = _now(), ""
+    while _now() - started < SERVING_TIMEOUT:
+        pods = _get_json(ctx, "-n", namespace, "get", "pods", "-l", "app=qwen-vl").get("items", [])
+        summary = (
+            ", ".join(sorted(f"{p['metadata']['name']}={_pod_summary(p)}" for p in pods)) or "（还没有 Pod）"
+        )
+        if summary != last:
+            ctx.console.status("info", f"{int(_now() - started)}s：{summary}")
+            last = summary
+        if any(_pod_summary(p) == "Ready" for p in pods):
+            ctx.console.status("ok", f"推理服务已就绪（{int(_now() - started)}s）")
+            return
+        _sleep(POLL_INTERVAL)
+    ctx.console.status(
+        "warn",
+        f"{SERVING_TIMEOUT // 60} 分钟内没有就绪的 vLLM 副本，通常是主力 GPU 机型没有容量（ICE）",
+    )
+    ctx.console.line(f"      查看原因：kubectl -n {namespace} get events --sort-by=.lastTimestamp | tail")
+    ctx.console.line(
+        f"      临时改用回退机型：kubectl -n {namespace} scale deploy/vllm-<回退 profile> --replicas=1"
+    )
+
+
 PHASES: Tuple[Phase, ...] = (
     ("cdk-deps", "准备 CDK（依赖和编译）", _cdk_deps),
     ("cdk-bootstrap", "CDK bootstrap（只有首次需要）", _cdk_bootstrap),
@@ -243,6 +336,8 @@ PHASES: Tuple[Phase, ...] = (
     ("karpenter", "安装 Karpenter", _karpenter),
     ("nodepools", "创建节点池：通用 CPU（非 GPU 业务）+ GPU", _nodepools),
     ("verify", "检查集群状态", _verify),
+    ("model-sync", "同步模型权重到 S3（首次约 5 分钟）", _model_sync),
+    ("serving", "部署 vLLM 推理服务（首次约 5~8 分钟）", _serving),
 )
 
 

@@ -108,8 +108,50 @@ class DeploymentConfig:
                 "alertEmail": a.features.alert_email,
             },
             "observability": {"mode": self.observability_mode},
+            "serving": serving_section(),
             "advanced": dict(self.advanced),
         }
+
+
+# 推理服务的固定命名（Python 生成、CDK 读取：Pod Identity 关联和 K8s 清单用的是同一份）
+SERVING_NAMESPACE = "qwen-vl"
+VLLM_SERVICE_ACCOUNT = "vllm"
+SYNC_SERVICE_ACCOUNT = "model-sync"
+MODEL_PREFIX = "models/"
+
+
+def serving_section() -> Dict[str, Any]:
+    return {
+        "namespace": SERVING_NAMESPACE,
+        "vllmServiceAccount": VLLM_SERVICE_ACCOUNT,
+        "syncServiceAccount": SYNC_SERVICE_ACCOUNT,
+        "modelPrefix": MODEL_PREFIX,
+    }
+
+
+def migrate_config(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """旧版本 qwenctl 保存的配置缺少后来新增的派生字段（不含客户输入）：补上默认值，不改客户的选择。"""
+    from .advanced import DEFAULTS, deep_merge  # 避免循环导入
+    from .catalog import PROFILES
+
+    catalog = {p.name: p for p in PROFILES}
+    gpu = dict(data.get("gpu") or {})
+    profiles = []
+    for profile in gpu.get("profiles", []):
+        known = catalog.get(profile.get("name"))
+        defaults = (
+            {"podCpu": known.pod_cpu, "podMemory": known.pod_memory, "servingLimits": profile_limits(known)}
+            if known
+            else {}
+        )
+        profiles.append({**defaults, **profile})
+    return {
+        **data,
+        "gpu": {**gpu, "profiles": profiles},
+        "serving": {**serving_section(), **dict(data.get("serving") or {})},
+        # 新版本新增的高级配置项用默认值补上；客户已有的值优先
+        "advanced": deep_merge(DEFAULTS, data.get("advanced") or {}),
+    }
 
 
 def _network_dict(network: NetworkChoice, endpoints: EndpointPlan) -> Dict[str, Any]:
@@ -141,4 +183,15 @@ def _placement_dict(placement: ProfilePlacement) -> Dict[str, Any]:
         "nodepoolWeight": p.nodepool_weight,
         "experimental": p.experimental,
         "zoneIds": list(placement.zone_ids),
+        "podCpu": p.pod_cpu,
+        "podMemory": p.pod_memory,
+        "servingLimits": profile_limits(p),
+    }
+
+
+def profile_limits(profile: Any) -> Dict[str, Any]:
+    return {
+        "maxModelLen": profile.max_model_len,
+        "maxNumSeqs": profile.max_num_seqs,
+        "maxImages": profile.max_images,
     }

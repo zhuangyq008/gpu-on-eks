@@ -49,11 +49,14 @@
      karpenter     helm 安装 karpenter-crd + karpenter（跑在系统节点上）
      nodepools     kubectl 创建 EC2NodeClass / NodePool：通用 CPU + 每个 GPU profile 一个
      verify        等 Karpenter 就绪、EC2NodeClass Ready（说明 IAM/子网/安全组/AMI 都没问题）
-  ⑤ 后续阶段（待实现）：KEDA、网关、可观测性、权重同步、镜像预缓存快照、编译缓存、vLLM
+     model-sync    集群内 Job：把锁定 revision 的模型从 HF 同步到 S3 模型桶（可重复执行，已有的文件跳过）
+     serving       每个 GPU profile 一个 vLLM Deployment（主力 profile = minReplicas，回退 profile = 0），
+                   Run:ai Streamer 从 S3 流式加载权重；等到至少一个副本就绪（主力机型没货时给出提示，不会一直卡住）
+  ⑤ 后续阶段（待实现）：KEDA（含回退 profile 的自动扩容）、网关、可观测性、镜像预缓存快照、编译缓存
 ```
 
 - **断线或失败**：CloudFormation 的变更会继续在服务端执行。重新打开 CloudShell 后运行 `./qwenctl deploy --resume`，用保存的配置从第一个未完成的阶段继续，不会再提问。
-- **更新**：再运行一次 `./qwenctl deploy`，所有阶段重新执行（每个阶段都可以重复执行）。
+- **更新**：`./qwenctl deploy --update` 用保存的配置重新执行所有阶段，不再提问（升级交付包后使用）。旧版本保存的配置缺少的派生字段会自动补上，客户的选择保持不变。
 - **自动化**：`--yes` 只用默认值生成配置，不会部署；要部署必须再加 `--approve`。`--plan` 只生成配置。
 
 ### 1.3 权限和安全
@@ -65,6 +68,9 @@
 - Karpenter 控制器角色的信任策略只允许本集群 `kube-system/karpenter` 这个 ServiceAccount 使用（Pod Identity 会话 tag）。
 - `--resume` 会重新校验保存的配置，并确认当前登录的账号和 region 与部署一致。
 - 本地文件（`~/.qwenctl/` 下的配置、状态、kubeconfig、Helm values）只有本人可读写。
+- 推理服务：命名空间强制 Pod Security `baseline`；容器去掉全部 capabilities、启用 seccomp RuntimeDefault；权重同步 Job 以非 root 运行。**已知例外**：vLLM 容器暂时以 root 运行（确认镜像在非 root 下的缓存目录和 NCCL 行为后再收紧）。
+- 权重完整性：同步时逐文件对比 HF 公布的哈希；之后的「跳过」判断信任 S3 对象元数据。信任边界是能写模型桶的主体（只有同步 Job 的角色，vLLM 只读），模型桶开启了版本控制，可以回滚。
+- vLLM 目前没有认证，Service 只在集群内（ClusterIP）。**交付客户前必须**加网关 + API Key，并开启 VPC CNI 的网络策略执行、只放行网关（计划在网关阶段完成）。
 
 ### 1.4 客户端工具
 
@@ -258,7 +264,7 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 
 | 命令 | 作用 |
 |---|---|
-| `deploy` | 首次部署或更新。`--resume` 从中断处继续；`--plan` 只生成配置；`--yes --approve` 无人值守部署 |
+| `deploy` | 首次部署。`--resume` 从中断处继续；`--update` 用保存的配置重新执行全部阶段；`--plan` 只生成配置；`--yes --approve` 无人值守部署 |
 | `status` | 当前阶段、各组件状态、访问地址、获取 API Key 的命令 |
 | `test` | 在集群内发测试请求（选了内部访问时用它验证） |
 | `scale --min N --max M` | 调整副本范围，会按配额校验 |
@@ -292,7 +298,8 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ synth 通过，未部署 | `infra/lib/network-stack.ts` |
 | CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ synth 通过，未部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
 | 客户端安装流程（7 个阶段、断点续跑、锁定版本工具） | ✅ **已在 ap-southeast-5 真实部署验证**（见 §9.1） | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
-| KEDA、网关、可观测性栈、权重同步、镜像快照、编译缓存、vLLM | ⏳ | — |
+| 推理服务层：模型桶 + Pod Identity（CDK），权重同步 Job、每个 GPU profile 一个 vLLM Deployment（Run:ai Streamer 从 S3 加载） | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.2） | `infra/lib/serving-stack.ts`、`cli/qwenctl/serving.py`、`assets/model_sync.py` |
+| KEDA（含回退 profile 自动扩容）、网关、可观测性栈、镜像快照、编译缓存 | ⏳ | — |
 | `status` / `test` / `scale` / `destroy` 等命令 | ⏳ | — |
 
 测试：Python 221 个（3.9 和 3.12 都跑，覆盖率 98%）；CDK 45 个。部署前的安全评审（2026-11-03）：没有 CRITICAL/HIGH，5 个 MEDIUM 和 5 个 LOW 已全部修复。
@@ -338,3 +345,27 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | 8 路并发（每路 1 张图 + 128 token） | TTFT p50 0.47 s / max 0.64 s，墙钟 3.3 s，输出 311 tok/s |
 
 结论：g6.12xlarge TP=2 作为回退 profile 可用，KV 余量比预估的好（8K 上下文 9 路并发）。
+
+### 9.2 推理服务层验证（2026-11-04，`./qwenctl deploy --update`）
+
+**权重同步（HF → S3，一次性）**：37.5 GB / 27 个文件用了 418 s（约 90 MB/s），**逐文件哈希校验全部通过**（LFS 文件比对 sha256，其余比对 git blob sha1）。同步 Job 以非 root 运行，凭证来自 Pod Identity。同步 Pod 等了约 5.5 分钟才启动，原因是通用节点的 gp3 数据盘默认只有 125 MB/s，解压 9 GB 的 vLLM 镜像很慢（待优化）。
+
+**vLLM 从 S3 流式加载（g6.12xlarge TP=2，保温节点：节点已在、镜像已在）**
+
+| 阶段 | 今天 | 昨天基线 |
+|---|---|---|
+| 镜像 | 0 s（节点上已有） | 91 s |
+| 进程启动、TP worker、NCCL | ~60 s | ~58 s |
+| 权重 | **37 s**（Run:ai Streamer 从 S3 读取 31 s） | 137 s 下载 + 12 s 加载 |
+| torch.compile | 31 s（缓存未命中） | 31.5 s |
+| profiling、CUDA graph、KV cache | ~70 s | ~95 s |
+| **Pod 创建 → Ready** | **3 分 50 秒** | 7 分 17 秒 |
+
+**推理（经 Service `qwen-vl.qwen-vl.svc`）**：纯文本 0.56 s；铭牌图片 → JSON 2.11 s，7 个字段全部正确；8 路并发 TTFT p50 0.41 s，输出 332 tok/s。
+
+**真实部署里发现并修复的问题**
+- g6-tp2 用默认参数（32K 上下文、256 并发、4 张图）会在分配 KV cache 时失败（`No available memory for the cache blocks`）→ 每个 GPU profile 带自己的参数上限：g6-tp2 = 8K / 16 / 2 张图，g7e 用默认值（32K / 128 / 4 张图）
+- 旧版本保存的配置缺少新增的高级配置项（`max_num_seqs`）→ `--update` 迁移配置时合并高级配置的默认值，客户已填的值优先
+- g7e 仍然没有容量（ICE），回退目前要手工扩容 → 由 KEDA 自动完成（下一步）
+
+**离 ≤90 s（保温节点）/ ≤3 分钟（新节点）的目标还差**：编译缓存放 S3（约 30 s）、profiling 和 CUDA graph 的开销（约 70 s，可以调小 cudagraph capture size）、进程启动（约 60 s）。新节点还要加上节点启动（约 40 s）和镜像拉取（改用实例存储 RAID0 + ECR，或者 EBS 快照，待实测对比）。

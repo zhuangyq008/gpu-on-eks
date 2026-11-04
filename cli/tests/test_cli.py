@@ -234,3 +234,88 @@ def test_resume_refuses_other_account_or_tampered_config(gw, tmp_path, monkeypat
     con, out = make_console()
     assert main(["deploy", "--resume"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
     assert "格式不对" in out.getvalue()
+
+
+def test_update_reruns_all_phases_and_migrates_old_config(gw, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    old = json.loads(path.read_text(encoding="utf-8"))
+    old.pop("serving")  # 模拟旧版本 qwenctl 保存的配置
+    old["gpu"]["maxReplicas"] = 1
+    path.write_text(json.dumps(old), encoding="utf-8")
+    install = RecordingInstall()
+    con, out = make_console()
+    assert main(["deploy", "--update"], _factory(gw), con, install) == EXIT_OK
+    (request,) = install.requests
+    assert request.resume is False
+    assert request.config["serving"]["namespace"] == "qwen-vl"
+    assert request.config["gpu"]["maxReplicas"] == 1  # 客户的选择保持不变
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["serving"]["vllmServiceAccount"] == "vllm"
+    assert "已为保存的配置补上新版本新增的字段" in out.getvalue()
+
+
+def test_resume_and_update_are_exclusive(gw):
+    con, out = make_console()
+    assert (
+        main(["deploy", "--resume", "--update"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    )
+    assert "只能选一个" in out.getvalue()
+
+
+def test_migrate_fills_profile_sizing_from_catalog_without_overriding():
+    from qwenctl.models import migrate_config
+
+    old = {
+        "gpu": {"profiles": [{"name": "g6-tp2"}, {"name": "g7e-1gpu", "podCpu": "4"}, {"name": "unknown"}]},
+    }
+    profiles = migrate_config(old)["gpu"]["profiles"]
+    assert profiles[0] == {
+        "name": "g6-tp2",
+        "podCpu": "20",
+        "podMemory": "88Gi",
+        "servingLimits": {"maxModelLen": 8192, "maxNumSeqs": 16, "maxImages": 2},
+    }
+    assert profiles[1]["podCpu"] == "4" and profiles[1]["podMemory"] == "48Gi"
+    assert profiles[2] == {"name": "unknown"}
+
+
+def test_resume_rejects_tampered_serving_names(gw, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["serving"]["namespace"] = "../kube-system"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    con, out = make_console()
+    assert main(["deploy", "--update"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    assert "serving 的命名格式不对" in out.getvalue()
+
+
+def test_migrate_fills_new_advanced_defaults_but_keeps_customer_values():
+    from qwenctl.models import migrate_config
+
+    old = {
+        "gpu": {"profiles": []},
+        "advanced": {"serving": {"max_model_len": 4096}, "general_nodes": {"cpu_limit": 64}},
+    }
+    advanced = migrate_config(old)["advanced"]
+    assert advanced["serving"]["max_model_len"] == 4096  # 客户的值
+    assert advanced["serving"]["max_num_seqs"] == 128  # 新版本新增的默认值
+    assert advanced["general_nodes"] == {"arch": ["amd64"], "capacity_types": ["on-demand"], "cpu_limit": 64}
+
+
+def test_update_revalidates_hand_edited_advanced_config(gw, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["advanced"]["serving"]["gpu_memory_utilization"] = 1.5
+    path.write_text(json.dumps(data), encoding="utf-8")
+    con, out = make_console()
+    assert main(["deploy", "--update"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    assert "gpu_memory_utilization" in out.getvalue()

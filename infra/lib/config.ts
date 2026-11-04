@@ -42,6 +42,22 @@ const profileSchema = z.object({
   nodepoolWeight: z.number().int().min(1).max(100),
   experimental: z.boolean(),
   zoneIds: z.array(zoneId).min(1),
+  podCpu: z.string().optional(),
+  podMemory: z.string().optional(),
+});
+
+const k8sName = z
+  .string()
+  .max(63)
+  .regex(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/, '不是合法的 K8s 名称')
+  .refine((n) => !n.startsWith('kube-'), { message: '不能使用 kube- 开头的系统命名空间' });
+
+/** 推理服务的命名：由 qwenctl 生成，CDK 用来建 Pod Identity 关联和限定 S3 前缀 */
+const servingSchema = z.object({
+  namespace: k8sName,
+  vllmServiceAccount: k8sName,
+  syncServiceAccount: k8sName,
+  modelPrefix: z.string().regex(/^[a-z0-9][a-z0-9._-]*\/$/, '应该是以 / 结尾的 S3 前缀，例如 models/'),
 });
 
 const networkSchema = z.object({
@@ -117,6 +133,7 @@ export const configSchema = z
       alertEmail: z.string().nullable(),
     }),
     observability: z.object({ mode: z.enum(['cloudwatch', 'grafana']) }),
+    serving: servingSchema,
     advanced: advancedSchema,
   })
   .superRefine((cfg, ctx) => {

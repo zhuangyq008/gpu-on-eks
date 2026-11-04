@@ -13,6 +13,7 @@ DEFAULTS: Mapping[str, Mapping[str, Any]] = {
         "max_images_per_request": 4,
         "max_image_pixels": 2097152,
         "gpu_memory_utilization": 0.92,
+        "max_num_seqs": 128,
     },
     "scaling": {
         "c_sla": {},
@@ -77,6 +78,7 @@ _ENUMS: Mapping[Path, frozenset] = {
 _RANGES: Mapping[Path, Tuple[float, float]] = {
     ("serving", "gpu_memory_utilization"): (0.5, 0.98),
     ("serving", "max_images_per_request"): (1, 16),
+    ("serving", "max_num_seqs"): (1, 1024),
     ("scaling", "target_utilization"): (0.1, 1.0),
     ("scaling", "kv_cache_threshold"): (0.1, 1.0),
     ("general_nodes", "cpu_limit"): (2, 10000),

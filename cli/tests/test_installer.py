@@ -44,11 +44,26 @@ def _versions(tampered: bool = False) -> dict:
     return versions
 
 
+SERVING_OUTPUTS = {"ModelBucketName": "qwen-vl-serving-modelbucket-abc"}
+READY_POD = {
+    "metadata": {"name": "vllm-g7e-1gpu-0"},
+    "status": {"phase": "Running", "containerStatuses": [{"ready": True, "state": {"running": {}}}]},
+}
+
+
 class FakeRunner:
-    def __init__(self, fail_on: Optional[str] = None, cfn_error: bool = False) -> None:
+    def __init__(
+        self,
+        fail_on: Optional[str] = None,
+        cfn_error: bool = False,
+        job_status: Optional[dict] = None,
+        pods: Optional[list] = None,
+    ) -> None:
         self.calls: List[dict] = []
         self.fail_on = fail_on
         self.cfn_error = cfn_error
+        self.job_status = job_status if job_status is not None else {"succeeded": 1}
+        self.pods = pods if pods is not None else [READY_POD]
 
     def run(
         self, args: Sequence[str], *, cwd=None, input_text=None, capture=False, env=None
@@ -70,9 +85,17 @@ class FakeRunner:
         if "describe-stacks" in args:
             if self.cfn_error:
                 raise CommandError(args, 255, "AccessDenied")
+            stack = args[args.index("--stack-name") + 1]
+            outputs = SERVING_OUTPUTS if stack.endswith("-serving") else EKS_OUTPUTS
             return CommandResult(
-                0, json.dumps([{"OutputKey": k, "OutputValue": v} for k, v in EKS_OUTPUTS.items()])
+                0, json.dumps([{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()])
             )
+        if "get" in args and "job" in args:
+            return CommandResult(0, json.dumps({"status": self.job_status}))
+        if "get" in args and "pods" in args:
+            return CommandResult(0, json.dumps({"items": self.pods}))
+        if "logs" in args:
+            return CommandResult(0, "Traceback: boom")
         return CommandResult(0, "")
 
     def commands(self) -> List[str]:
@@ -137,7 +160,7 @@ def test_full_install_runs_every_phase_in_order(tmp_path):
     assert installs[0].startswith("/bin/helm upgrade --install karpenter-crd ")
     assert installs[0].split()[4].endswith("charts/karpenter-crd-1.15.1.tgz")
     assert "--skip-crds" in installs[1] and "--wait" in installs[1]
-    apply = next(c for c in runner.calls if "apply" in c["args"])
+    apply = next(c for c in runner.calls if "apply" in c["args"] and "NodePool" in (c["input"] or ""))
     assert apply["args"][-4:] == ["--field-manager", "qwenctl", "-f", "-"]
     items = json.loads(apply["input"])["items"]
     assert [i["metadata"]["name"] for i in items if i["kind"] == "NodePool"] == [
@@ -274,3 +297,78 @@ def test_write_private_replaces_stale_tmp_with_loose_permissions(tmp_path):
     assert target.read_text(encoding="utf-8") == "{}"
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
     assert not stale.exists()
+
+
+@pytest.fixture(autouse=True)
+def fast_clock(monkeypatch):
+    """把等待循环的时钟换成假的：每次 sleep 前进对应秒数，测试不真的等待。"""
+    from qwenctl import installer
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(installer, "_now", lambda: clock["t"])
+    monkeypatch.setattr(installer, "_sleep", lambda seconds: clock.__setitem__("t", clock["t"] + seconds))
+    return clock
+
+
+def _applied(runner, kind):
+    return [
+        i for c in runner.calls if c["input"] for i in json.loads(c["input"])["items"] if i["kind"] == kind
+    ]
+
+
+def test_model_sync_and_serving_phases(tmp_path):
+    runner = FakeRunner()
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    (job,) = _applied(runner, "Job")
+    env = {e["name"]: e["value"] for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["S3_BUCKET"] == "qwen-vl-serving-modelbucket-abc"
+    assert env["S3_PREFIX"] == "models/qwen3.5-35b-a3b-fp8/9d1823d2dee6/"
+    deployments = {d["metadata"]["name"]: d["spec"]["replicas"] for d in _applied(runner, "Deployment")}
+    assert deployments == {"vllm-g7e-1gpu": 2, "vllm-g6-tp2": 0}
+    text = out.getvalue()
+    assert "权重已同步到 s3://qwen-vl-serving-modelbucket-abc/models/" in text
+    assert "推理服务已就绪" in text
+
+
+def test_model_sync_failure_shows_job_logs(tmp_path):
+    failed = {"conditions": [{"type": "Failed", "status": "True", "message": "BackoffLimitExceeded"}]}
+    ctx, _ = _ctx(tmp_path, FakeRunner(job_status=failed))
+    with pytest.raises(InstallError) as info:
+        run_install(ctx, resume=False)
+    assert info.value.phase == "model-sync"
+    assert "BackoffLimitExceeded" in str(info.value) and "Traceback: boom" in str(info.value)
+
+
+def test_model_sync_timeout(tmp_path):
+    ctx, _ = _ctx(tmp_path, FakeRunner(job_status={"active": 1}))
+    with pytest.raises(InstallError, match="权重同步超过 60 分钟"):
+        run_install(ctx, resume=False)
+
+
+def test_serving_without_capacity_warns_instead_of_hanging(tmp_path):
+    pending = {"metadata": {"name": "vllm-g7e-1gpu-0"}, "status": {"phase": "Pending"}}
+    ctx, out = _ctx(tmp_path, FakeRunner(pods=[pending]))
+    state = run_install(ctx, resume=False)
+    assert state["completed"][-1] == "serving"
+    text = out.getvalue()
+    assert "vllm-g7e-1gpu-0=Pending" in text
+    assert "没有就绪的 vLLM 副本" in text and "scale deploy/vllm-<回退 profile>" in text
+
+
+def test_pod_summary_states():
+    from qwenctl.installer import _pod_summary
+
+    waiting = {"status": {"containerStatuses": [{"state": {"waiting": {"reason": "ImagePullBackOff"}}}]}}
+    loading = {"status": {"containerStatuses": [{"ready": False, "state": {"running": {}}}]}}
+    assert _pod_summary(waiting) == "ImagePullBackOff"
+    assert _pod_summary(loading) == "Running（加载模型中）"
+    assert _pod_summary(READY_POD) == "Ready"
+    assert _pod_summary({"status": {}}) == "Unknown"
+
+
+def test_missing_bucket_output(tmp_path, monkeypatch):
+    monkeypatch.setitem(SERVING_OUTPUTS, "ModelBucketName", "")
+    ctx, _ = _ctx(tmp_path, FakeRunner())
+    with pytest.raises(InstallError, match="ModelBucketName"):
+        run_install(ctx, resume=False)

@@ -10,13 +10,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from . import __version__
-from .advanced import ConfigError, load_advanced
+from .advanced import ConfigError, load_advanced, validate
 from .console import Aborted, Console
 from .endpoints import plan_endpoints, wanted_interface_endpoints
 from .gateway import AwsGateway, GatewayError
 from .installer import InstallError
-from .models import DeploymentConfig
-from .paths import DeploymentPaths
+from .models import DeploymentConfig, migrate_config
+from .paths import DeploymentPaths, write_private
 from .preflight import PreflightReport, pick_system_instance_type, run_preflight
 from .questions import ask_all
 from .render import show_preflight, summary_lines
@@ -111,6 +111,11 @@ def _parser() -> argparse.ArgumentParser:
             cmd.add_argument("--plan", action="store_true", help="只生成并保存配置，不部署")
             cmd.add_argument("--resume", action="store_true", help="用上次保存的配置，从中断的阶段继续")
             cmd.add_argument(
+                "--update",
+                action="store_true",
+                help="用上次保存的配置重新执行全部阶段（升级交付包后使用，不提问）",
+            )
+            cmd.add_argument(
                 "--output", default=None, help="配置保存路径（默认 ~/.qwenctl/<name>/config.json）"
             )
     return parser
@@ -136,7 +141,9 @@ def main(
     try:
         validate_name(args.name)
         install_fn = install or _default_install  # 调用时再解析，测试可以替换
-        if getattr(args, "resume", False):
+        if getattr(args, "resume", False) and getattr(args, "update", False):
+            raise ConfigError("--resume 和 --update 只能选一个")
+        if getattr(args, "resume", False) or getattr(args, "update", False):
             return _resume(con, gateway_factory(args.region), args, install_fn)
         advanced = load_advanced(args.config)
         gw = gateway_factory(args.region)
@@ -256,16 +263,26 @@ def _resume(con: Console, gw: AwsGateway, args: argparse.Namespace, install: Ins
     except (OSError, ValueError) as exc:
         raise ConfigError(f"找不到可以继续的部署配置 {path}，请先运行 ./qwenctl deploy") from exc
     _validate_saved_config(config, gw)
-    con.status("info", f"继续部署 {config['name']}（{config['account']} / {config['region']}）")
-    request = _request(con, config["name"], config["region"], config["account"], config, path)
+    migrated = migrate_config(config)
+    validate(migrated["advanced"])  # 手改过的高级配置也要重新校验
+    if migrated != config:
+        write_private(path, json.dumps(migrated, ensure_ascii=False, indent=2) + "\n")
+        con.status("info", "已为保存的配置补上新版本新增的字段（不改变你的选择）")
+    action = "更新" if args.update else "继续部署"
+    con.status("info", f"{action} {config['name']}（{config['account']} / {config['region']}）")
+    request = _request(con, config["name"], config["region"], config["account"], migrated, path)
     bootstrapped = gw.stack_status("CDKToolkit") is not None
-    install(InstallRequest(**{**request.__dict__, "cdk_bootstrapped": bootstrapped, "resume": True}))
+    install(
+        InstallRequest(**{**request.__dict__, "cdk_bootstrapped": bootstrapped, "resume": not args.update})
+    )
     _print_done(con, config["name"])
     return EXIT_OK
 
 
 _ACCOUNT = re.compile(r"^\d{12}$")
 _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
+_K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+_PREFIX = re.compile(r"^[a-z0-9][a-z0-9._-]*/$")
 
 
 def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
@@ -277,6 +294,14 @@ def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
     validate_name(name)
     if not _ACCOUNT.fullmatch(account) or not _REGION.fullmatch(region):
         raise ConfigError("保存的部署配置里账号或 region 格式不对，请重新运行 ./qwenctl deploy")
+    serving = config.get("serving") or {}
+    names = [
+        serving.get(k) for k in ("namespace", "vllmServiceAccount", "syncServiceAccount") if k in serving
+    ]
+    if any(not isinstance(n, str) or not _K8S_NAME.fullmatch(n) for n in names) or (
+        "modelPrefix" in serving and not _PREFIX.fullmatch(str(serving["modelPrefix"]))
+    ):
+        raise ConfigError("保存的部署配置里 serving 的命名格式不对，请重新运行 ./qwenctl deploy")
     caller_account, _ = gw.caller_identity()
     if caller_account != account or gw.region() != region:
         raise ConfigError(

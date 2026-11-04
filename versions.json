@@ -39,5 +39,16 @@
       "version": "1.15.1",
       "sha256": "51f74d19d578847804ffce7b22a0d87d89e540e90067f2bd392d9e19b71990fe"
     }
+  },
+  "images": {
+    "vllm": {
+      "tag": "docker.io/vllm/vllm-openai:v0.32.0",
+      "digest": "sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+    }
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "revision": "9d1823d2dee688a6b25e77009dc727688c44936e",
+    "sizeGB": 37.5
   }
 }
