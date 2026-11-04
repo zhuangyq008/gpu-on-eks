@@ -49,10 +49,15 @@
      karpenter     helm 安装 karpenter-crd + karpenter（跑在系统节点上）
      nodepools     kubectl 创建 EC2NodeClass / NodePool：通用 CPU + 每个 GPU profile 一个
      verify        等 Karpenter 就绪、EC2NodeClass Ready（说明 IAM/子网/安全组/AMI 都没问题）
-     model-sync    集群内 Job：把锁定 revision 的模型从 HF 同步到 S3 模型桶（可重复执行，已有的文件跳过）
-     serving       每个 GPU profile 一个 vLLM Deployment（主力 profile = minReplicas，回退 profile = 0），
-                   Run:ai Streamer 从 S3 流式加载权重；等到至少一个副本就绪（主力机型没货时给出提示，不会一直卡住）
-  ⑤ 后续阶段（待实现）：KEDA（含回退 profile 的自动扩容）、网关、可观测性、镜像预缓存快照、编译缓存
+     metrics       helm 安装集群内 Prometheus（kube-prometheus-stack 精简版，只给 KEDA 做查询，保留 6 小时），
+                   等 Prometheus 可用后才进入下一阶段
+     keda          helm 安装 KEDA（跑在系统节点上）
+     model-sync    集群内 Job：把锁定 revision 的模型从 HF 同步到 S3 模型桶，逐文件校验哈希；
+                   S3 上已有完成标记（_COMPLETE）就直接跳过，不起 Job
+     serving       每个 GPU profile 一个 vLLM Deployment（新建时主力 = minReplicas，回退 = 0；之后副本数归 KEDA 管），
+                   Run:ai Streamer 从 S3 流式加载权重；PodMonitor + 每个 profile 一个 KEDA ScaledObject；
+                   等到至少一个副本就绪（主力机型没货时给出提示，不会一直卡住）
+  ⑤ 后续阶段（待实现）：网关、可观测性（CloudWatch 模式）、镜像预缓存、编译缓存
 ```
 
 - **断线或失败**：CloudFormation 的变更会继续在服务端执行。重新打开 CloudShell 后运行 `./qwenctl deploy --resume`，用保存的配置从第一个未完成的阶段继续，不会再提问。
@@ -70,6 +75,7 @@
 - 本地文件（`~/.qwenctl/` 下的配置、状态、kubeconfig、Helm values）只有本人可读写。
 - 推理服务：命名空间强制 Pod Security `baseline`；容器去掉全部 capabilities、启用 seccomp RuntimeDefault；权重同步 Job 以非 root 运行。**已知例外**：vLLM 容器暂时以 root 运行（确认镜像在非 root 下的缓存目录和 NCCL 行为后再收紧）。
 - 权重完整性：同步时逐文件对比 HF 公布的哈希；之后的「跳过」判断信任 S3 对象元数据。信任边界是能写模型桶的主体（只有同步 Job 的角色，vLLM 只读），模型桶开启了版本控制，可以回滚。
+- 扩缩容：KEDA 和 Prometheus 跑在系统节点上，命名空间强制 Pod Security baseline；Prometheus 只在集群内（ClusterIP），不对外写。扩缩容指标决定 GPU 副本数（也就是成本），所以 Prometheus **只加载两个可信命名空间里的监控对象**：推理命名空间（vLLM 的 PodMonitor）和 monitoring（kube-state-metrics）。客户业务命名空间里的 PodMonitor 或者规则加载不进来，没法伪造 `vllm:*` / `kube_pod_*` 指标。只抓 KEDA 要用的指标（不装 node-exporter，不抓 kubelet、API server、CoreDNS）。KEDA 只能读自己命名空间的 Secret。Deployment 的副本数交给单独的 field manager（`qwenctl-replicas`）持有，重跑 `--update` 不会把回退 profile 从 0 重置成 1。GPU 节点总数由每个 NodePool 的 GPU 上限兜底。注意主力和回退 profile 各自最多 maxReplicas 个副本，同时打满时成本是两者之和。**生产加固待做**：chart 里的镜像改为 digest 引用或者同步到客户 ECR；用 NetworkPolicy 限制只有 KEDA 能访问 Prometheus。
 - vLLM 目前没有认证，Service 只在集群内（ClusterIP）。**交付客户前必须**加网关 + API Key，并开启 VPC CNI 的网络策略执行、只放行网关（计划在网关阶段完成）。
 
 ### 1.4 客户端工具
@@ -150,7 +156,7 @@ serving:
   max_image_pixels: 2097152          # 约 2 MP
   gpu_memory_utilization: 0.92
 scaling:
-  c_sla: {}                          # 为空时用内置的占位值；压测后用 qwenctl tune 写入实测值
+  c_sla: {}                          # key 是 GPU profile 名（如 g7e-1gpu: 40）；为空时用内置的占位值，压测后用 qwenctl tune 写入实测值
   target_utilization: 0.65
   waiting_threshold: 4
   kv_cache_threshold: 0.8
@@ -288,7 +294,7 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 
 ---
 
-## 9. 实现进度（2026-11-03）
+## 9. 实现进度（2026-11-04）
 
 | 部分 | 状态 | 位置 |
 |---|---|---|
@@ -297,12 +303,13 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | 部署配置契约（Python → CDK） | ✅ zod 校验 + 契约测试 | `cli/qwenctl/models.py`、`infra/lib/config.ts`、`infra/test/contract.test.ts` |
 | CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ synth 通过，未部署 | `infra/lib/network-stack.ts` |
 | CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ synth 通过，未部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
-| 客户端安装流程（7 个阶段、断点续跑、锁定版本工具） | ✅ **已在 ap-southeast-5 真实部署验证**（见 §9.1） | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
+| 客户端安装流程（11 个阶段、断点续跑、锁定版本工具） | ✅ **已在 ap-southeast-5 真实部署验证**（见 §9.1） | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
 | 推理服务层：模型桶 + Pod Identity（CDK），权重同步 Job、每个 GPU profile 一个 vLLM Deployment（Run:ai Streamer 从 S3 加载） | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.2） | `infra/lib/serving-stack.ts`、`cli/qwenctl/serving.py`、`assets/model_sync.py` |
-| KEDA（含回退 profile 自动扩容）、网关、可观测性栈、镜像快照、编译缓存 | ⏳ | — |
+| 弹性伸缩：集群内 Prometheus + KEDA，主力按负载扩缩容，回退 profile 在主力没货时自动扩出 | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.3） | `cli/qwenctl/platform.py`、`autoscaling.py` |
+| 网关、可观测性栈、镜像预缓存、编译缓存 | ⏳ | — |
 | `status` / `test` / `scale` / `destroy` 等命令 | ⏳ | — |
 
-测试：Python 221 个（3.9 和 3.12 都跑，覆盖率 98%）；CDK 45 个。部署前的安全评审（2026-11-03）：没有 CRITICAL/HIGH，5 个 MEDIUM 和 5 个 LOW 已全部修复。
+测试：Python 281 个（3.9 和 3.12 都跑，覆盖率 98%）；CDK 51 个。部署前的安全评审：2026-11-03 没有 CRITICAL/HIGH，5 个 MEDIUM 和 5 个 LOW 已全部修复；2026-11-04（弹性伸缩）没有 CRITICAL/HIGH，3 个 MEDIUM 和 8 个 LOW 修复了 10 个。没修的 1 个 LOW：副本数交接遇到冲突时不自动重试，apply 会安全失败，`--resume` 重跑即可。
 
 ### 9.1 端到端验证（2026-11-03，ap-southeast-5，`./qwenctl deploy --yes --approve`）
 
@@ -366,6 +373,35 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 **真实部署里发现并修复的问题**
 - g6-tp2 用默认参数（32K 上下文、256 并发、4 张图）会在分配 KV cache 时失败（`No available memory for the cache blocks`）→ 每个 GPU profile 带自己的参数上限：g6-tp2 = 8K / 16 / 2 张图，g7e 用默认值（32K / 128 / 4 张图）
 - 旧版本保存的配置缺少新增的高级配置项（`max_num_seqs`）→ `--update` 迁移配置时合并高级配置的默认值，客户已填的值优先
-- g7e 仍然没有容量（ICE），回退目前要手工扩容 → 由 KEDA 自动完成（下一步）
+- g7e 仍然没有容量（ICE），回退当时要手工扩容 → 已改为由 KEDA 自动完成（见 §9.3）
 
 **离 ≤90 s（保温节点）/ ≤3 分钟（新节点）的目标还差**：编译缓存放 S3（约 30 s）、profiling 和 CUDA graph 的开销（约 70 s，可以调小 cudagraph capture size）、进程启动（约 60 s）。新节点还要加上节点启动（约 40 s）和镜像拉取（改用实例存储 RAID0 + ECR，或者 EBS 快照，待实测对比）。
+
+### 9.3 弹性伸缩验证（2026-11-04，`./qwenctl deploy --update` / `--resume`）
+
+**场景**：g7e 在 apse5-az2 仍然没有容量（ICE），主力 Pod 已经 Pending 了 24 分钟；回退 profile（g6-tp2）副本数为 0。安装 Prometheus + KEDA 后，**没有任何手工操作**：
+
+| 时间（UTC） | 事件 | 间隔 |
+|---|---|---|
+| 02:47:31 | qwenctl 创建 ScaledObject | — |
+| 02:47:32~42 | KEDA 的前两次查询被拒绝（Prometheus 刚启动）。`fallback: currentReplicasIfHigher` 生效：保持当前副本数，没有误缩容 | — |
+| 02:48:02 | KEDA：`Scaled vllm-g6-tp2 from 0 to 1, triggered by s0-prometheus`（「主力 Pod 创建超过 180 s 还调度不上」的数量 = 1） | 31 s |
+| 02:48:03 → 02:48:44 | Karpenter 创建 NodeClaim → g6.12xlarge 启动 → 注册 → Ready | 41 s |
+| 02:48:43 → 02:50:12 | 拉取 vLLM 镜像（9.2 GB，Docker Hub） | 89 s |
+| 02:50:12 → 02:51:45 | 进程启动 + 从 S3 流式加载权重（37 s） | 93 s |
+| 02:51:45 → 02:54:04 | profiling、KV cache、CUDA graph、torch.compile（31 s，缓存未命中） | 139 s |
+| **02:48:02 → 02:54:04** | **KEDA 触发 → 回退副本 Ready** | **6 分 2 秒** |
+
+新部署时还要加上主力 Pod 被判定为「调度不上」的 180 s，以及指标抓取和 KEDA 轮询（约 30 s）。所以主力没货时，**约 9.5 分钟后有回退副本在服务**。之后的主要优化空间在冷启动（下一阶段）：镜像预缓存约省 90 s，编译缓存约省 30 s，调小 CUDA graph capture size。
+
+**推理（回退副本，经 Service）**：铭牌图片 → JSON 2.07 s，7 个字段全部正确。vLLM 服务端指标：TTFT 平均 0.28 s，排队 0。
+- **待查**：同一个 Pod 模板换了一台 g6 节点后，服务端 inter-token latency 约 22 ms，昨天约 11 ms；8 路并发输出 209 tok/s，昨天 332 tok/s。已经排除 GPU P2P（g6.12xlarge 上所有 GPU 对都不支持 P2P，custom allreduce 一直是关的）、CPU 争用（节点空闲）和配置差异。放到冷启动 / 性能阶段，用集群内压测（不经过 port-forward）逐节点对比。
+- 客户端经 `kubectl port-forward` 测到的 8 路并发 TTFT 是 2.1 s，比服务端多约 1.8 s，这部分是测试路径的开销。网关上线后不再经过 port-forward。
+
+**真实部署里发现并修复的问题**
+- 同步 Job 的模板不可变：ConfigMap 改名后，同名 Job 的 apply 被拒绝 → Job 名改为对整个 Pod 模板求哈希；S3 上已有 `_COMPLETE` 标记就直接跳过（不用为了确认「已完成」去拉起 CPU 节点、拉 9 GB 镜像，约省 5 分钟）
+- Prometheus 的 StatefulSet 由 operator 异步创建，helm 不会等它 → metrics 阶段等 Prometheus CR `Available` 后才装 KEDA
+- **副本数被重置（安全评审发现，集群上复现）**：qwenctl 的 apply 省略 `replicas`（交给 KEDA）。但如果 `replicas` 只归 qwenctl 所有，server-side apply 会把它删掉、回到默认值 1。重跑 `--update` 时，回退 profile 会从 0 变成 1，白白拉起一台 GPU 节点。改为把 `replicas` 交给单独的 field manager。用临时 Deployment 验证过：不交接 0 → 1，交接后保持 0
+- **回退信号（代码评审发现）**：最初用的是「Pod Pending 超过 180 s」。但镜像拉取期间 Pod 也是 Pending（这次 g6 Pod 就 Pending 了 130 s，其中拉镜像 89 s），主力正常扩容时（新节点约 40 s + 拉镜像约 90 s）很容易超过 180 s，误扩出回退 GPU 节点。改为「调度不上」（`kube_pod_status_unschedulable`，即 PodScheduled=False / Unschedulable）：ICE 时一直是 1；有容量时 Karpenter 约 40 s 就能让 Pod 调度上。Pod 名改为精确匹配 `vllm-<profile>-<哈希>-<后缀>`，profile 名互为前缀（g6 / g6-tp2）时不会串。有 3 个以上 profile 时，回退按顺序接力（第二个看主力，第三个看第二个），不会同时扩出
+- 交接用的部分对象（只有 `replicas`）不能包在 `v1 List` 里一起 apply：kubectl 会在客户端按完整 Deployment 校验，因为缺 selector / template 而拒绝。改为逐个 apply 单个对象，由服务端校验合并后的结果；对象不存在时服务端照样拒绝，不会建出残缺的对象。重跑时 g6 副本一直在服务，没有重启
+- 安全评审的其他修复：Prometheus 只加载可信命名空间的监控对象；KEDA 不能读全集群的 Secret；去掉 node-exporter（它要 hostNetwork + hostPID 跑在每个节点上）；monitoring / keda 命名空间强制 PSA baseline；`waiting_threshold`、`c_sla` 和保存配置里的 GPU 数值加了范围校验

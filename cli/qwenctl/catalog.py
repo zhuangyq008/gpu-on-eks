@@ -9,6 +9,9 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+# 没有压测数据时，单副本在 SLA 内的并发占位值
+DEFAULT_C_SLA = 24
+
 
 @dataclass(frozen=True)
 class GpuProfile:
@@ -31,6 +34,9 @@ class GpuProfile:
     max_model_len: Optional[int] = None
     max_num_seqs: Optional[int] = None
     max_images: Optional[int] = None
+    # 单副本在 SLA 内的并发（扩缩容阈值 = target_utilization × c_sla）。压测前是占位值，
+    # 压测后用 advanced.scaling.c_sla 覆盖
+    c_sla: int = DEFAULT_C_SLA
 
     @property
     def replicas_per_node(self) -> int:
@@ -63,6 +69,7 @@ PROFILES: Tuple[GpuProfile, ...] = (
         tensor_parallel=1,
         priority=3,
         extra_instance_types=("g7e.4xlarge",),
+        c_sla=32,
     ),
     GpuProfile(
         name="g6e-1gpu",
@@ -92,6 +99,7 @@ PROFILES: Tuple[GpuProfile, ...] = (
         max_model_len=8192,
         max_num_seqs=16,
         max_images=2,
+        c_sla=8,
     ),
 )
 

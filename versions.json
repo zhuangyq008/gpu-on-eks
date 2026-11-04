@@ -38,6 +38,16 @@
       "repository": "oci://public.ecr.aws/karpenter",
       "version": "1.15.1",
       "sha256": "51f74d19d578847804ffce7b22a0d87d89e540e90067f2bd392d9e19b71990fe"
+    },
+    "kube-prometheus-stack": {
+      "repository": "https://prometheus-community.github.io/helm-charts",
+      "version": "92.17.1",
+      "sha256": "fc8fe107f94a3009c04af63a03fb811393970db0eb973a9c513941acfce565c1"
+    },
+    "keda": {
+      "repository": "https://kedacore.github.io/charts",
+      "version": "2.21.0",
+      "sha256": "a7da56bf41a33dad9d2fc82a6fdecee552fff947d80bf1e1dbcf4db0f9e26dee"
     }
   },
   "images": {

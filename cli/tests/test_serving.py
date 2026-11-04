@@ -32,7 +32,7 @@ def _profile(config, name):
 def test_image_is_pinned_by_digest_and_prefix_includes_revision(config):
     assert image_ref(VERSIONS) == f"docker.io/vllm/vllm-openai@{VERSIONS['images']['vllm']['digest']}"
     assert model_prefix(config, VERSIONS) == "models/qwen3.5-35b-a3b-fp8/9d1823d2dee6/"
-    assert re.fullmatch(r"model-sync-9d1823d2-[0-9a-f]{6}", sync_job_name(VERSIONS))
+    assert re.fullmatch(r"model-sync-9d1823d2-[0-9a-f]{6}", sync_job_name(VERSIONS, {"spec": {}}))
 
 
 def test_vllm_args_follow_profile_and_advanced_config(config):
@@ -135,11 +135,16 @@ def test_namespace_enforces_pod_security_baseline(config):
     assert namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "baseline"
 
 
-def test_job_name_changes_when_script_changes(monkeypatch, tmp_path):
+def test_job_name_changes_whenever_the_pod_template_changes(config, monkeypatch, tmp_path):
     from qwenctl import serving
 
-    before = sync_job_name(VERSIONS)
+    def name(cfg=config):
+        return next(m for m in sync_job(cfg, VERSIONS, BUCKET) if m["kind"] == "Job")["metadata"]["name"]
+
+    before = name()
+    assert name() == before  # 同样的输入，同样的名字（重复执行不会新建 Job）
+    assert name({**config, "region": "us-east-1"}) != before  # 环境变量变了
     changed = tmp_path / "model_sync.py"
     changed.write_text("print('v2')", encoding="utf-8")
     monkeypatch.setattr(serving, "SYNC_SCRIPT", str(changed))
-    assert sync_job_name(VERSIONS) != before
+    assert name() != before  # 脚本变了（ConfigMap 名字也跟着变）

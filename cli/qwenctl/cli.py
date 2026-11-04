@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from . import __version__
-from .advanced import ConfigError, load_advanced, validate
+from .advanced import C_SLA_RANGE, ConfigError, load_advanced, validate
 from .console import Aborted, Console
 from .endpoints import plan_endpoints, wanted_interface_endpoints
 from .gateway import AwsGateway, GatewayError
 from .installer import InstallError
 from .models import DeploymentConfig, migrate_config
+from .names import is_k8s_name
 from .paths import DeploymentPaths, write_private
 from .preflight import PreflightReport, pick_system_instance_type, run_preflight
 from .questions import ask_all
@@ -281,8 +282,43 @@ def _resume(con: Console, gw: AwsGateway, args: argparse.Namespace, install: Ins
 
 _ACCOUNT = re.compile(r"^\d{12}$")
 _REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
-_K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _PREFIX = re.compile(r"^[a-z0-9][a-z0-9._-]*/$")
+# 只是防篡改的上限；实际上限在提问时按 G/VT 配额算
+MAX_GPU_REPLICAS = 256
+
+
+def _validate_saved_names(config: Mapping[str, Any]) -> None:
+    """这些名字会拼进 K8s 清单和 PromQL。"""
+    serving = config.get("serving") or {}
+    names = [
+        serving.get(k) for k in ("namespace", "vllmServiceAccount", "syncServiceAccount") if k in serving
+    ]
+    if not all(is_k8s_name(n) for n in names) or (
+        "modelPrefix" in serving and not _PREFIX.fullmatch(str(serving["modelPrefix"]))
+    ):
+        raise ConfigError("保存的部署配置里 serving 的命名格式不对，请重新运行 ./qwenctl deploy")
+    profiles = (config.get("gpu") or {}).get("profiles") or []
+    if not all(isinstance(p, Mapping) and is_k8s_name(p.get("name")) for p in profiles):
+        raise ConfigError("保存的部署配置里 GPU profile 的名字格式不对，请重新运行 ./qwenctl deploy")
+
+
+def _int_in(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _validate_saved_gpu_numbers(gpu: Mapping[str, Any]) -> None:
+    """这些数值决定扩缩容阈值和副本数上限（也就是 GPU 成本）。"""
+    low, high = gpu.get("minReplicas", 1), gpu.get("maxReplicas", 1)
+    profiles = gpu.get("profiles") or []
+    ok = (
+        _int_in(low, 1, MAX_GPU_REPLICAS)
+        and _int_in(high, 1, MAX_GPU_REPLICAS)
+        and low <= high
+        and all(_int_in(p.get("tensorParallel", 1), 1, 8) for p in profiles)
+        and all("cSla" not in p or _int_in(p["cSla"], *C_SLA_RANGE) for p in profiles)
+    )
+    if not ok:
+        raise ConfigError("保存的部署配置里 GPU 副本数或 profile 参数不对，请重新运行 ./qwenctl deploy")
 
 
 def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
@@ -294,14 +330,8 @@ def _validate_saved_config(config: Mapping[str, Any], gw: AwsGateway) -> None:
     validate_name(name)
     if not _ACCOUNT.fullmatch(account) or not _REGION.fullmatch(region):
         raise ConfigError("保存的部署配置里账号或 region 格式不对，请重新运行 ./qwenctl deploy")
-    serving = config.get("serving") or {}
-    names = [
-        serving.get(k) for k in ("namespace", "vllmServiceAccount", "syncServiceAccount") if k in serving
-    ]
-    if any(not isinstance(n, str) or not _K8S_NAME.fullmatch(n) for n in names) or (
-        "modelPrefix" in serving and not _PREFIX.fullmatch(str(serving["modelPrefix"]))
-    ):
-        raise ConfigError("保存的部署配置里 serving 的命名格式不对，请重新运行 ./qwenctl deploy")
+    _validate_saved_names(config)
+    _validate_saved_gpu_numbers(config.get("gpu") or {})
     caller_account, _ = gw.caller_identity()
     if caller_account != account or gw.region() != region:
         raise ConfigError(

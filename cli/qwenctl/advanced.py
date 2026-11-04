@@ -7,6 +7,8 @@ import ipaddress
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from .names import is_k8s_name
+
 DEFAULTS: Mapping[str, Mapping[str, Any]] = {
     "serving": {
         "max_model_len": 32768,
@@ -80,6 +82,7 @@ _RANGES: Mapping[Path, Tuple[float, float]] = {
     ("serving", "max_images_per_request"): (1, 16),
     ("serving", "max_num_seqs"): (1, 1024),
     ("scaling", "target_utilization"): (0.1, 1.0),
+    ("scaling", "waiting_threshold"): (1, 1000),
     ("scaling", "kv_cache_threshold"): (0.1, 1.0),
     ("general_nodes", "cpu_limit"): (2, 10000),
 }
@@ -144,6 +147,15 @@ def _validate_enum(here: Path, dotted: str, value: Any) -> None:
 
 
 _IAM_ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]+$")
+C_SLA_RANGE = (1, 1024)
+
+
+def _bad_c_sla(key: Any, value: Any) -> bool:
+    if not is_k8s_name(key):
+        return True
+    return (
+        isinstance(value, bool) or not isinstance(value, int) or not C_SLA_RANGE[0] <= value <= C_SLA_RANGE[1]
+    )
 
 
 def _validate_special(here: Path, dotted: str, value: Any) -> None:
@@ -156,6 +168,13 @@ def _validate_special(here: Path, dotted: str, value: Any) -> None:
         bad = [v for v in value if not isinstance(v, str) or not _IAM_ROLE_ARN.match(v)]
         if bad:
             raise ConfigError(f"{dotted} 里有不是 IAM 角色 ARN 的值：{bad}")
+    elif here == ("scaling", "c_sla"):
+        bad = {k: v for k, v in value.items() if _bad_c_sla(k, v)}
+        if bad:
+            raise ConfigError(
+                f"{dotted} 的 key 是 GPU profile 名，value 是 {C_SLA_RANGE[0]}~{C_SLA_RANGE[1]} 的整数"
+                f"（单副本在 SLA 内的并发）：{bad}"
+            )
     elif here == ("network", "cidr"):
         try:
             network = ipaddress.ip_network(value, strict=True)

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import os
 import stat
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import pytest
 
@@ -33,7 +34,12 @@ EKS_OUTPUTS = {
     "KarpenterInterruptionQueueName": "queue-1",
     "PrivateSubnetIds": "subnet-0a,subnet-0b",
 }
-CHART_BYTES = {"karpenter-crd": b"fake-crd-chart", "karpenter": b"fake-karpenter-chart"}
+CHART_BYTES = {
+    "karpenter-crd": b"fake-crd-chart",
+    "karpenter": b"fake-karpenter-chart",
+    "kube-prometheus-stack": b"fake-kps-chart",
+    "keda": b"fake-keda-chart",
+}
 
 
 def _versions(tampered: bool = False) -> dict:
@@ -58,12 +64,19 @@ class FakeRunner:
         cfn_error: bool = False,
         job_status: Optional[dict] = None,
         pods: Optional[list] = None,
+        deployments: Optional[Dict[str, int]] = None,
+        get_error: bool = False,
+        synced: bool = False,
     ) -> None:
         self.calls: List[dict] = []
         self.fail_on = fail_on
         self.cfn_error = cfn_error
         self.job_status = job_status if job_status is not None else {"succeeded": 1}
         self.pods = pods if pods is not None else [READY_POD]
+        self.deployments = deployments or {}
+        self.get_error = get_error
+        self.head_error = "An error occurred (404) when calling the HeadObject operation: Not Found"
+        self.synced = synced
 
     def run(
         self, args: Sequence[str], *, cwd=None, input_text=None, capture=False, env=None
@@ -77,7 +90,7 @@ class FakeRunner:
             with open(args[args.index("--outputs-file") + 1], "w", encoding="utf-8") as handle:
                 json.dump({"qwen-vl-network": {}, "qwen-vl-eks": EKS_OUTPUTS}, handle)
         if "pull" in args:
-            chart = args[args.index("pull") + 1].rsplit("/", 1)[-1]
+            chart = args[args.index("pull") + 1].rsplit("/", 1)[-1]  # oci://repo/chart 或 chart --repo URL
             version = args[args.index("--version") + 1]
             destination = args[args.index("--destination") + 1]
             with open(os.path.join(destination, f"{chart}-{version}.tgz"), "wb") as handle:
@@ -90,10 +103,17 @@ class FakeRunner:
             return CommandResult(
                 0, json.dumps([{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()])
             )
+        if "head-object" in args and not self.synced:
+            raise CommandError(args, 254, self.head_error)
         if "get" in args and "job" in args:
             return CommandResult(0, json.dumps({"status": self.job_status}))
         if "get" in args and "pods" in args:
             return CommandResult(0, json.dumps({"items": self.pods}))
+        if "get" in args and "deployments" in args:
+            if self.get_error:
+                raise CommandError(args, 1, "Unauthorized")
+            items = [{"metadata": {"name": n}, "spec": {"replicas": r}} for n, r in self.deployments.items()]
+            return CommandResult(0, json.dumps({"items": items}))
         if "logs" in args:
             return CommandResult(0, "Traceback: boom")
         return CommandResult(0, "")
@@ -310,10 +330,30 @@ def fast_clock(monkeypatch):
     return clock
 
 
-def _applied(runner, kind):
+def _items(payload):
+    data = json.loads(payload)
+    return data["items"] if data.get("kind") == "List" else [data]
+
+
+def _applied(runner, kind, manager="qwenctl"):
     return [
-        i for c in runner.calls if c["input"] for i in json.loads(c["input"])["items"] if i["kind"] == kind
+        i
+        for c in runner.calls
+        if c["input"] and c["args"][c["args"].index("--field-manager") + 1] == manager
+        for i in _items(c["input"])
+        if i["kind"] == kind
     ]
+
+
+def _manager_order(runner):
+    """每次 apply 的 (field manager, [Deployment 名]) ，按调用顺序。"""
+    order = []
+    for c in runner.calls:
+        if c["input"] and "--field-manager" in c["args"]:
+            names = [i["metadata"]["name"] for i in _items(c["input"]) if i["kind"] == "Deployment"]
+            if names:
+                order.append((c["args"][c["args"].index("--field-manager") + 1], names))
+    return order
 
 
 def test_model_sync_and_serving_phases(tmp_path):
@@ -353,7 +393,8 @@ def test_serving_without_capacity_warns_instead_of_hanging(tmp_path):
     assert state["completed"][-1] == "serving"
     text = out.getvalue()
     assert "vllm-g7e-1gpu-0=Pending" in text
-    assert "没有就绪的 vLLM 副本" in text and "scale deploy/vllm-<回退 profile>" in text
+    assert "没有就绪的 vLLM 副本" in text and "KEDA 会自动扩出回退机型" in text
+    assert "get scaledobject,hpa" in text
 
 
 def test_pod_summary_states():
@@ -372,3 +413,154 @@ def test_missing_bucket_output(tmp_path, monkeypatch):
     ctx, _ = _ctx(tmp_path, FakeRunner())
     with pytest.raises(InstallError, match="ModelBucketName"):
         run_install(ctx, resume=False)
+
+
+def test_platform_charts_go_to_their_namespaces_on_system_nodes(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    installs = {c["args"][3]: c["args"] for c in runner.calls if "upgrade" in c["args"]}
+    assert installs["kps"][installs["kps"].index("--namespace") + 1] == "monitoring"
+    assert installs["keda"][installs["keda"].index("--namespace") + 1] == "keda"
+    assert "--create-namespace" in installs["keda"]
+    pulls = [c["args"] for c in runner.calls if "pull" in c["args"]]
+    assert ["keda", "--repo", "https://kedacore.github.io/charts"] == next(p for p in pulls if "keda" in p)[
+        2:5
+    ]
+    with open(os.path.join(ctx.paths.root, "prometheus-values.json"), encoding="utf-8") as handle:
+        values = json.load(handle)
+    assert values["prometheus"]["prometheusSpec"]["nodeSelector"] == {"qwenctl/node-role": "system"}
+    assert values["grafana"] == {"enabled": False}
+
+
+def test_serving_applies_autoscaling_and_leaves_existing_replicas_to_keda(tmp_path):
+    runner = FakeRunner(deployments={"vllm-g7e-1gpu": 3})
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    deployments = {d["metadata"]["name"]: d["spec"] for d in _applied(runner, "Deployment")}
+    assert "replicas" not in deployments["vllm-g7e-1gpu"]  # 已存在：副本数归 KEDA
+    assert deployments["vllm-g6-tp2"]["replicas"] == 0  # 首次创建：回退从 0 开始
+    assert [o["metadata"]["name"] for o in _applied(runner, "ScaledObject")] == [
+        "vllm-g7e-1gpu",
+        "vllm-g6-tp2",
+    ]
+    assert len(_applied(runner, "PodMonitor")) == 1
+
+
+def test_model_sync_skips_job_when_marker_exists(tmp_path):
+    runner = FakeRunner(synced=True)
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _applied(runner, "Job") == []
+    head = next(c["args"] for c in runner.calls if "head-object" in c["args"])
+    assert head[head.index("--key") + 1] == "models/qwen3.5-35b-a3b-fp8/9d1823d2dee6/_COMPLETE"
+    assert "已经同步并校验过，跳过" in out.getvalue()
+
+
+def test_keda_is_installed_only_after_prometheus_is_available(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    commands = runner.commands()
+    wait = next(
+        i for i, c in enumerate(commands) if "wait prometheus.monitoring.coreos.com/kps-prometheus" in c
+    )
+    assert "-n monitoring --for=condition=Available" in commands[wait]
+    kps = next(i for i, c in enumerate(commands) if "upgrade --install kps" in c)
+    keda = next(i for i, c in enumerate(commands) if "upgrade --install keda" in c)
+    assert kps < wait < keda
+
+
+def test_replicas_are_handed_to_a_separate_field_manager(tmp_path):
+    """qwenctl 的 apply 省略 replicas 时，replicas 不能只归 qwenctl 所有，否则 SSA 会把它重置为 1。"""
+    runner = FakeRunner(deployments={"vllm-g7e-1gpu": 3})
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _manager_order(runner) == [
+        ("qwenctl-replicas", ["vllm-g7e-1gpu"]),  # 已有的：先交出（值不变），再省略 replicas
+        ("qwenctl", ["vllm-g7e-1gpu", "vllm-g6-tp2"]),
+        ("qwenctl-replicas", ["vllm-g6-tp2"]),  # 新建的：创建后马上交出
+    ]
+    # 部分对象不能包在 v1 List 里：kubectl 会在客户端按完整 Deployment 校验而拒绝（真实集群上踩过）
+    payloads = [
+        json.loads(c["input"]) for c in runner.calls if c["input"] and "qwenctl-replicas" in c["args"]
+    ]
+    assert payloads and all(p["kind"] == "Deployment" for p in payloads)
+    handover = {d["metadata"]["name"]: d for d in _applied(runner, "Deployment", "qwenctl-replicas")}
+    assert handover["vllm-g7e-1gpu"]["spec"] == {"replicas": 3}
+    assert handover["vllm-g6-tp2"]["spec"] == {"replicas": 0}
+
+
+def test_unreadable_deployments_fail_instead_of_resetting_replicas(tmp_path):
+    runner = FakeRunner(get_error=True)
+    ctx, _ = _ctx(tmp_path, runner)
+    with pytest.raises(InstallError) as err:
+        run_install(ctx, resume=False)
+    assert err.value.phase == "serving"
+    assert _applied(runner, "Deployment") == []
+
+
+def test_unexpected_marker_error_warns_and_runs_the_job(tmp_path):
+    runner = FakeRunner()
+    runner.head_error = "An error occurred (403) when calling the HeadObject operation: Forbidden"
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert len(_applied(runner, "Job")) == 1
+    assert "没法确认" in out.getvalue() and "403" in out.getvalue()
+
+
+def test_missing_marker_runs_the_job_quietly(tmp_path):
+    runner = FakeRunner()
+    ctx, out = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert len(_applied(runner, "Job")) == 1
+    assert "没法确认" not in out.getvalue()
+
+
+def test_platform_namespaces_get_pod_security_before_helm(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    labels = {n["metadata"]["name"]: n["metadata"]["labels"] for n in _applied(runner, "Namespace")}
+    for ns in ("monitoring", "keda"):
+        assert labels[ns]["pod-security.kubernetes.io/enforce"] == "baseline"
+
+    def first_call(predicate):
+        return next(i for i, c in enumerate(runner.calls) if predicate(c))
+
+    def creates_namespace(name):
+        return lambda c: bool(c["input"]) and any(
+            i["kind"] == "Namespace" and i["metadata"]["name"] == name for i in _items(c["input"])
+        )
+
+    def helm_installs(release):
+        return lambda c: "upgrade" in c["args"] and release in c["args"]
+
+    assert first_call(creates_namespace("monitoring")) < first_call(helm_installs("kps"))
+    assert first_call(creates_namespace("keda")) < first_call(helm_installs("keda"))
+
+
+def test_fresh_install_creates_with_initial_replicas_then_hands_them_over(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    run_install(ctx, resume=False)
+    assert _manager_order(runner) == [
+        ("qwenctl", ["vllm-g7e-1gpu", "vllm-g6-tp2"]),
+        ("qwenctl-replicas", ["vllm-g6-tp2"]),
+        ("qwenctl-replicas", ["vllm-g7e-1gpu"]),
+    ]
+    handover = {d["metadata"]["name"]: d["spec"] for d in _applied(runner, "Deployment", "qwenctl-replicas")}
+    assert handover == {
+        "vllm-g7e-1gpu": {"replicas": ctx.config["gpu"]["minReplicas"]},
+        "vllm-g6-tp2": {"replicas": 0},
+    }
+
+
+def test_bad_profile_name_in_saved_config_is_an_install_error(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = _ctx(tmp_path, runner)
+    bad = [{**ctx.config["gpu"]["profiles"][0], "name": "g7e.*"}]
+    ctx = dataclasses.replace(ctx, config={**ctx.config, "gpu": {**ctx.config["gpu"], "profiles": bad}})
+    with pytest.raises(InstallError, match="PromQL") as err:
+        run_install(ctx, resume=False)
+    assert err.value.phase == "serving"

@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Mapping
+from typing import AbstractSet, Any, Dict, List, Mapping, Optional
+
+from .addons import namespace_manifest
 
 Manifest = Dict[str, Any]
 
@@ -54,9 +56,10 @@ def _sync_digest(versions: Mapping[str, Any]) -> str:
     return hashlib.sha256((_sync_script() + image_ref(versions)).encode()).hexdigest()[:6]
 
 
-def sync_job_name(versions: Mapping[str, Any]) -> str:
-    """Job 的 Pod 模板不可变：名字里带上脚本和镜像的哈希，二者变了就换一个新 Job。"""
-    return f"model-sync-{versions['model']['revision'][:8]}-{_sync_digest(versions)}"
+def sync_job_name(versions: Mapping[str, Any], template: Mapping[str, Any]) -> str:
+    """Job 的 Pod 模板不可变：名字里带上整个模板的哈希，模板有任何变化就换一个新 Job。"""
+    digest = hashlib.sha256(json.dumps(template, sort_keys=True).encode()).hexdigest()[:6]
+    return f"model-sync-{versions['model']['revision'][:8]}-{digest}"
 
 
 def base_manifests(config: Mapping[str, Any]) -> List[Manifest]:
@@ -72,18 +75,7 @@ def base_manifests(config: Mapping[str, Any]) -> List[Manifest]:
         },
     }
     return [
-        {
-            "apiVersion": "v1",
-            "kind": "Namespace",
-            "metadata": {
-                "name": ns,
-                # 强制 baseline（禁止特权、hostPath、host 网络等），对 restricted 只告警
-                "labels": {
-                    "pod-security.kubernetes.io/enforce": "baseline",
-                    "pod-security.kubernetes.io/warn": "restricted",
-                },
-            },
-        },
+        namespace_manifest(ns),
         _service_account(ns, serving["vllmServiceAccount"]),
         _service_account(ns, serving["syncServiceAccount"]),
         service,
@@ -123,7 +115,7 @@ def sync_job(config: Mapping[str, Any], versions: Mapping[str, Any], bucket: str
     job = {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {"name": sync_job_name(versions), "namespace": ns, "labels": {"app": "model-sync"}},
+        "metadata": {"namespace": ns, "labels": {"app": "model-sync"}},
         "spec": {
             "backoffLimit": 2,
             "activeDeadlineSeconds": 3600,
@@ -167,7 +159,8 @@ def sync_job(config: Mapping[str, Any], versions: Mapping[str, Any], bucket: str
             },
         },
     }
-    return [configmap, job]
+    name = sync_job_name(versions, job["spec"]["template"])
+    return [configmap, {**job, "metadata": {"name": name, **job["metadata"]}}]
 
 
 def effective_limits(config: Mapping[str, Any], profile: Mapping[str, Any]) -> Dict[str, int]:
@@ -211,7 +204,7 @@ def vllm_deployment(
     versions: Mapping[str, Any],
     bucket: str,
     profile: Mapping[str, Any],
-    replicas: int,
+    replicas: Optional[int],
 ) -> Manifest:
     labels = {**APP_LABEL, "qwenctl/gpu-profile": profile["name"]}
     gpus = profile["tensorParallel"]
@@ -238,7 +231,7 @@ def vllm_deployment(
         "volumeMounts": [{"name": "cache", "mountPath": "/models"}, {"name": "shm", "mountPath": "/dev/shm"}],
         "securityContext": BASE_SECURITY_CONTEXT,
     }
-    return {
+    deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
@@ -247,7 +240,6 @@ def vllm_deployment(
             "labels": labels,
         },
         "spec": {
-            "replicas": replicas,
             # 不多开：多开一个副本就要多一台 GPU 节点
             "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}},
             "selector": {"matchLabels": labels},
@@ -275,6 +267,9 @@ def vllm_deployment(
             },
         },
     }
+    if replicas is None:  # 已存在的 Deployment：副本数归 KEDA 管，不覆盖
+        return deployment
+    return {**deployment, "spec": {"replicas": replicas, **deployment["spec"]}}
 
 
 def _probe(period: int, failures: int) -> Dict[str, Any]:
@@ -285,10 +280,18 @@ def _probe(period: int, failures: int) -> Dict[str, Any]:
     }
 
 
-def vllm_deployments(config: Mapping[str, Any], versions: Mapping[str, Any], bucket: str) -> List[Manifest]:
-    """主力 profile（优先级最高的，排在第一个）跑 minReplicas，其余从 0 开始。"""
+def vllm_deployments(
+    config: Mapping[str, Any],
+    versions: Mapping[str, Any],
+    bucket: str,
+    existing: AbstractSet[str] = frozenset(),
+) -> List[Manifest]:
+    """首次创建时：主力 profile 跑 minReplicas，其余从 0 开始。已经存在的 Deployment 不写副本数（由 KEDA 管）。"""
     profiles = config["gpu"]["profiles"]
     minimum = config["gpu"]["minReplicas"]
-    return [
-        vllm_deployment(config, versions, bucket, p, minimum if i == 0 else 0) for i, p in enumerate(profiles)
-    ]
+    result = []
+    for index, profile in enumerate(profiles):
+        name = f"vllm-{profile['name']}"
+        initial = None if name in existing else (minimum if index == 0 else 0)
+        result.append(vllm_deployment(config, versions, bucket, profile, initial))
+    return result

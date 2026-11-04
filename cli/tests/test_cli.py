@@ -3,6 +3,8 @@ import os
 import stat
 from dataclasses import replace
 
+import pytest
+
 from qwenctl.cli import (
     EXIT_ABORTED,
     EXIT_AWS_ERROR,
@@ -243,7 +245,7 @@ def test_update_reruns_all_phases_and_migrates_old_config(gw, tmp_path, monkeypa
     path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
     old = json.loads(path.read_text(encoding="utf-8"))
     old.pop("serving")  # 模拟旧版本 qwenctl 保存的配置
-    old["gpu"]["maxReplicas"] = 1
+    old["gpu"].update(minReplicas=1, maxReplicas=1)
     path.write_text(json.dumps(old), encoding="utf-8")
     install = RecordingInstall()
     con, out = make_console()
@@ -277,6 +279,7 @@ def test_migrate_fills_profile_sizing_from_catalog_without_overriding():
         "podCpu": "20",
         "podMemory": "88Gi",
         "servingLimits": {"maxModelLen": 8192, "maxNumSeqs": 16, "maxImages": 2},
+        "cSla": 8,
     }
     assert profiles[1]["podCpu"] == "4" and profiles[1]["podMemory"] == "48Gi"
     assert profiles[2] == {"name": "unknown"}
@@ -319,3 +322,40 @@ def test_update_revalidates_hand_edited_advanced_config(gw, tmp_path, monkeypatc
     con, out = make_console()
     assert main(["deploy", "--update"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
     assert "gpu_memory_utilization" in out.getvalue()
+
+
+def test_resume_rejects_tampered_profile_names(gw, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["gpu"]["profiles"][0]["name"] = 'g7e"} or vector(99) #'
+    path.write_text(json.dumps(data), encoding="utf-8")
+    con, out = make_console()
+    assert main(["deploy", "--resume"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    assert "GPU profile 的名字格式不对" in out.getvalue()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda d: d["gpu"].update(minReplicas=0),
+        lambda d: d["gpu"].update(minReplicas=3, maxReplicas=2),
+        lambda d: d["gpu"].update(maxReplicas=10_000),
+        lambda d: d["gpu"]["profiles"][0].update(cSla=-5),
+        lambda d: d["gpu"]["profiles"][0].update(cSla="32"),
+        lambda d: d["gpu"]["profiles"][0].update(tensorParallel=True),
+    ],
+)
+def test_resume_rejects_tampered_gpu_numbers(gw, tmp_path, monkeypatch, tamper):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    con, _ = make_console(assume_defaults=True)
+    assert main(["deploy", "--yes"], _factory(gw), con) == EXIT_OK
+    path = tmp_path / ".qwenctl" / "qwen-vl" / "config.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    tamper(data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    con, out = make_console()
+    assert main(["deploy", "--resume"], _factory(gw), con, RecordingInstall()) == EXIT_CONFIG_ERROR
+    assert "GPU 副本数或 profile 参数不对" in out.getvalue()

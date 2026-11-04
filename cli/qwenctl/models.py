@@ -140,7 +140,12 @@ def migrate_config(data: Mapping[str, Any]) -> Dict[str, Any]:
     for profile in gpu.get("profiles", []):
         known = catalog.get(profile.get("name"))
         defaults = (
-            {"podCpu": known.pod_cpu, "podMemory": known.pod_memory, "servingLimits": profile_limits(known)}
+            {
+                "podCpu": known.pod_cpu,
+                "podMemory": known.pod_memory,
+                "servingLimits": profile_limits(known),
+                "cSla": known.c_sla,
+            }
             if known
             else {}
         )
@@ -186,6 +191,7 @@ def _placement_dict(placement: ProfilePlacement) -> Dict[str, Any]:
         "podCpu": p.pod_cpu,
         "podMemory": p.pod_memory,
         "servingLimits": profile_limits(p),
+        "cSla": p.c_sla,
     }
 
 

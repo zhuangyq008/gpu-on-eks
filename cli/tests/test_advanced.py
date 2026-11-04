@@ -43,6 +43,12 @@ def test_deep_merge_does_not_mutate_inputs():
         ({"network": {"cidr": "10.0.0.1/16"}}, "不是合法的 CIDR"),
         ({"compliance": {"tags": {"Owner": 1}}}, "key 和 value 都必须是字符串"),
         ({"compliance": {"extra_admin_role_arns": ["arn:aws:iam::123:user/x"]}}, "不是 IAM 角色 ARN"),
+        ({"scaling": {"waiting_threshold": 0}}, "1~1000"),
+        ({"scaling": {"waiting_threshold": float("nan")}}, "1~1000"),
+        ({"scaling": {"c_sla": {"g7e.2xlarge": 32}}}, "key 是 GPU profile 名"),
+        ({"scaling": {"c_sla": {"g7e-1gpu": "40"}}}, "1~1024 的整数"),
+        ({"scaling": {"c_sla": {"g7e-1gpu": -5}}}, "1~1024 的整数"),
+        ({"scaling": {"c_sla": {"g7e-1gpu": True}}}, "1~1024 的整数"),
     ],
 )
 def test_validate_rejects_bad_values(override, message):
@@ -53,7 +59,7 @@ def test_validate_rejects_bad_values(override, message):
 def test_validate_accepts_freeform_and_nullable():
     validate(
         {
-            "scaling": {"c_sla": {"g7e.2xlarge": 32}, "schedule": {"timezone": "Asia/Kuala_Lumpur"}},
+            "scaling": {"c_sla": {"g7e-1gpu": 32}, "schedule": {"timezone": "Asia/Kuala_Lumpur"}},
             "compliance": {
                 "tags": {"CostCenter": "mfg"},
                 "kms_key_arn": "arn:aws:kms:...",
