@@ -1,7 +1,22 @@
 # PoC 方案设计：EKS 上弹性部署 Qwen3.5-35B-A3B 图片分析服务（低冷启动）
 
-> 版本：v0.3（草案） | 日期：2026-11-03 | 目标 Region：**ap-southeast-5（马来西亚）**；§2.2 的 us-east-1 数据作为对照（部署时使用 CloudShell 所在的 region）
-> 状态：待确认（见 §13 待确认问题）
+> 版本：v0.4 | 日期：2026-11-04 | 目标 Region：**ap-southeast-5（马来西亚）**；§2.2 的 us-east-1 数据作为对照（部署时使用 CloudShell 所在的 region）
+> 状态：**方案设计（目标架构）**。待确认问题见 §13。已经实现的部分以 [04 架构与使用手册](04-architecture-and-operations.md) 为准，实测数据见 [05 测试报告](05-test-report.md)。
+
+**设计与当前实现的差异（2026-11-04）**
+
+| 本文的设计 | 当前实现 |
+|---|---|
+| §3 / §6 入口：WAF → ALB → Envoy AI Gateway（API Key、负载感知路由、背压）；SQS 异步通道；Bedrock 溢出 | **尚未实现**。服务只在集群内（ClusterIP），没有认证。马来西亚没有可用的 Bedrock 模型，溢出不可用 |
+| §3 指标：Prometheus remote_write → AMP → AMG；ADOT；DCGM Exporter | 只部署了精简的集群内 Prometheus：只抓 vLLM 和 kube-state-metrics，保留 6 小时，给 KEDA 用。GPU 健康由 EKS Node Monitoring Agent 提供。其余计划中（[04 §6](04-architecture-and-operations.md#6-可观测性如何使用)） |
+| §4.2 (1) 镜像：同步到 ECR + EBS 快照预缓存 | 改为 GPU 节点本地 NVMe（RAID0）+ SOCI 并行拉取，镜像仍从 Docker Hub 拉取：89 s → 52 s。ECR 和 EBS 快照待评估 |
+| §4.2 (3) 编译缓存：CI 在每种 GPU 上预热后上传 | 改为部署时由 qwenctl 从首个就绪副本保存到 S3（部署者凭证写入，vLLM 只读），之后的副本用 initContainer 恢复：引擎初始化 139 s → 25 s |
+| §4.2 (5) 常驻副本用 ODCR | GPU NodePool 的容量类型允许了 `reserved`，环境检查会提示已有的 ODCR；但 EC2NodeClass 没有配置容量预留选择器，**Karpenter 目前不会主动指定或优先使用 ODCR**（open 类型是否被 EC2 自动套用未验证） |
+| §0 / §7.1 关闭 thinking、限制图片像素；§8 `--allowed-media-domains` 防 SSRF | 都还没有在服务端实现：thinking 靠客户端在请求里关闭；图片像素没有限制；vLLM 可以拉取任意 URL 的图片。计划在网关阶段统一处理 |
+| §3 每个 profile 的副本由网关按负载路由 | 所有 profile 共用一个 Service、随机分发，客户端要按最小的上限发请求（[04 §1.3](04-architecture-and-operations.md#13-推理服务)） |
+| §5.3 扩缩容信号：负载、排队、KV 使用率、SQS、cron | 实现了负载和排队两个触发器，另加「主力 Pod 调度不上」触发回退（[04 §4](04-architecture-and-operations.md#4-弹性伸缩keda--karpenter)）。KV、SQS、cron 未实现 |
+| §7 配置示例 | 是设计阶段的示例，**不是实际生成的配置**。实际要点见 04 §1.3 和 §4，完整清单由 `cli/qwenctl/` 生成 |
+| §4.1 冷启动目标：新节点 ≤ 3 分钟 | 实测 3 分 38 秒（基线 6 分 02 秒），见下表「实测」列
 
 ---
 
@@ -97,7 +112,7 @@ KV 估算：10 层 × 2(K/V) × 2 heads × 256 × 2 B ≈ 20 KB/token；linear a
 ## 3. 总体架构
 
 ```
-                      ┌──────────────────────── AWS us-east-1 / VPC (2 AZ，自动选择) ─────────────────────────┐
+                      ┌──────────── 目标架构：AWS region（马来西亚）/ VPC（2 AZ，自动选择）──────────────┐
   同步客户端 ──HTTPS──►│ WAF ─► ALB ─► Envoy AI Gateway (CPU, Graviton, ≥2 pods)                                 │
                       │                 │  • API Key/JWT 鉴权、限流、请求体/图片大小校验                            │
                       │                 │  • InferencePool + EPP：按队列长度/KV 使用率选后端                         │
@@ -123,7 +138,7 @@ KV 估算：10 层 × 2(K/V) × 2 heads × 256 × 2 B ≈ 20 KB/token；linear a
 
 | 节点类型 | 管理方式 | 机型 | 污点 | 运行什么 |
 |---|---|---|---|---|
-| 系统节点 | EKS 托管节点组，固定 2 台 | m7g.large（Graviton，按 AZ 供货自动选） | `CriticalAddonsOnly` | Karpenter、CoreDNS、KEDA、Prometheus、ADOT 等插件 |
+| 系统节点 | EKS 托管节点组，固定 2 台 | m7g.large（Graviton，按 AZ 供货自动选） | `CriticalAddonsOnly` | Karpenter、CoreDNS、KEDA、Prometheus 等插件（ADOT 计划中） |
 | 通用 CPU 节点 | Karpenter NodePool | 默认 x86、按需实例，上限 200 vCPU（高级配置可改） | 无 | **客户的非 GPU 业务**、网关数据面、异步 Worker |
 | GPU 节点 | Karpenter NodePool，每个 GPU profile 一个 | 见 §2.3 | `nvidia.com/gpu` | 只有 vLLM（带对应 toleration） |
 
@@ -149,18 +164,18 @@ KV 估算：10 层 × 2(K/V) × 2 heads × 256 × 2 B ≈ 20 KB/token；linear a
 
 ### 4.1 冷启动链路拆解与时间预算
 
-| # | 阶段 | 默认做法耗时（估） | 优化手段 | 优化后目标 |
-|---|---|---|---|---|
-| 1 | **扩容决策** | HPA 按 CPU/GPU 利用率，有 stabilization 窗口：1~5 min | KEDA 10 s 轮询 vLLM 排队/并发指标；scaleUp stabilization = 0 | 15~30 s |
-| 2 | **节点就绪** | CA + MNG：2~4 min | Karpenter 直接调 EC2 Fleet；Bottlerocket NVIDIA 变体 | 45~75 s |
-| 3 | **镜像拉取**（vLLM 镜像 10 GB+） | 从 Docker Hub 拉取并解压：2~5 min | 镜像同步到 ECR；Bottlerocket 数据卷挂载**预缓存镜像的 EBS 快照**（备选：SOCI parallel pull） | 10~30 s |
-| 4 | **权重加载**（37.5 GB） | 从 HF 下载再加载：3~10 min | 权重放同 Region S3 + VPC Gateway Endpoint；vLLM `--load-format runai_streamer` 并发流式读入显存 | 15~40 s |
-| 5 | **Engine 初始化** | torch.compile + 全量 CUDA graph：1~3 min | 预热的 compile/Triton/FlashInfer 缓存放 S3，initContainer 同步；限制 `--max-cudagraph-capture-size`；`video: 0` 减少 profiling | 20~40 s |
-| 6 | **接入流量** | ALB IP target 注册 + 健康检查：30~90 s | ALB 只指向网关（稳定目标）；网关的 EPP 监听 Pod readiness | 1~5 s |
-| | **合计（新节点）** | **10~25 min** | | **≈ 2~3 min** |
-| | **合计（保温节点，跳过 2/3）** | | | **≈ 45~90 s** |
+| # | 阶段 | 默认做法耗时（估） | 优化手段 | 优化后目标 | 实测（2026-11-04，g6.12xlarge） |
+|---|---|---|---|---|---|
+| 1 | **扩容决策** | HPA 按 CPU/GPU 利用率，有 stabilization 窗口：1~5 min | KEDA 10 s 轮询 vLLM 排队/并发指标；scaleUp stabilization = 0 | 15~30 s | 按负载扩容未压测；回退判定是 180 s + 约 30 s |
+| 2 | **节点就绪** | CA + MNG：2~4 min | Karpenter 直接调 EC2 Fleet；Bottlerocket NVIDIA 变体 | 45~75 s | 37~42 s（从副本数变化算起） |
+| 3 | **镜像拉取**（vLLM 镜像 10 GB+） | 从 Docker Hub 拉取并解压：2~5 min | 镜像同步到 ECR；Bottlerocket 数据卷挂载**预缓存镜像的 EBS 快照**（备选：SOCI parallel pull） | 10~30 s | 52 s（实际采用：NVMe + SOCI 并行拉取，仍从 Docker Hub） |
+| 4 | **权重加载**（37.5 GB） | 从 HF 下载再加载：3~10 min | 权重放同 Region S3 + VPC Gateway Endpoint；vLLM `--load-format runai_streamer` 并发流式读入显存 | 15~40 s | 37 s（另有进程启动约 47 s） |
+| 5 | **Engine 初始化** | torch.compile + 全量 CUDA graph：1~3 min | 预热的 compile/Triton/FlashInfer 缓存放 S3，initContainer 同步；限制 `--max-cudagraph-capture-size`；`video: 0` 减少 profiling | 20~40 s | 25 s（编译缓存命中；未命中时约 125 s）；另有恢复缓存和启动容器 9 s |
+| 6 | **接入流量** | ALB IP target 注册 + 健康检查：30~90 s | ALB 只指向网关（稳定目标）；网关的 EPP 监听 Pod readiness | 1~5 s | 约 11 s（readiness probe；网关未实现） |
+| | **合计（新节点）** | **10~25 min** | | **≈ 2~3 min** | **3 分 38 秒**（基线 6 分 02 秒） |
+| | **合计（保温节点，跳过 2/3）** | | | **≈ 45~90 s** | 约 2 分钟（估算） |
 
-> 表中「优化后」是工程估算，PoC 第 2 周逐段实测（见 §10 指标）。
+> 「优化后目标」是设计阶段的工程估算；「实测」列来自 [05 测试报告 §6](05-test-report.md#6-冷启动)。
 
 ### 4.2 各项落地细节
 
@@ -247,6 +262,14 @@ HPA 行为（扩得激进、缩得保守，因为每次冷启动都很贵）：
 ---
 
 ## 7. 关键配置示例（PoC 起点，参数以实测为准）
+
+> 以下是**设计阶段的示例**，和实际生成的配置有出入，例如：
+> - 镜像来源：示例是 ECR + EBS 快照，实际是 Docker Hub + NVMe/SOCI；
+> - 扩缩容触发器：示例里的触发器和实际不同；
+> - 安全组选择方式：示例用 tag，实际直接用 ID；
+> - 编译缓存：示例里没有编译缓存的 initContainer。
+>
+> 实际配置的要点见 [04 §1.3、§4](04-architecture-and-operations.md)。
 
 ### 7.1 vLLM 容器
 

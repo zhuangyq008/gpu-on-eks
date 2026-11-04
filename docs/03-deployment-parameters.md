@@ -1,7 +1,7 @@
 # 部署参数与交互设计：客户 CloudShell 一键部署
 
-> 版本：v0.3 | 日期：2026-11-03 | 关联：[01-architecture-design.md](01-architecture-design.md)、[02-observability-design.md](02-observability-design.md)
-> 状态：已确认（2026-11-03）
+> 版本：v1.0 | 日期：2026-11-04 | 关联：[01 方案设计](01-architecture-design.md)、[02 可观测性设计](02-observability-design.md)、[04 架构与使用手册](04-architecture-and-operations.md)、[05 测试报告](05-test-report.md)
+> 状态：交互和参数设计已确认（2026-11-03）。**哪些已经实现、哪些还在计划中，以各节的「状态」标注和 §9 为准**；当前的用法见 [04](04-architecture-and-operations.md)。
 
 ---
 
@@ -10,15 +10,15 @@
 | 维度 | 决策 |
 |---|---|
 | 交付形态 | 客户在自己账号的 CloudShell（或跳板机）里运行 `./qwenctl deploy` |
-| 执行位置 | **在执行 qwenctl 的客户端上执行**（2026-11-03 确认）：AWS 资源由 CloudFormation 在服务端创建；Helm chart 和 K8s 资源由本机的 helm/kubectl 安装。不使用 CodeBuild |
+| 执行位置 | **在执行 qwenctl 的客户端上执行**（2026-11-03 确认）：AWS 资源由 CloudFormation 在服务端创建；Helm chart 和 K8s 资源由本机的 helm/kubectl 安装。不使用 CodeBuild（但环境检查目前还会检查 CodeBuild 权限，是已知问题，见 [04 §7](04-architecture-and-operations.md#7-已知限制与后续计划)） |
 | IaC | CDK TypeScript → CloudFormation（状态在服务端）。TypeScript 在发布交付包时预先编译，客户端只装运行依赖（实测 215 MB） |
 | 客户要回答的 | **4 个问题**：网络、访问方式、副本数、可选能力。其余参数自动探测或使用默认值 |
 | 目标 region | **ap-southeast-5（马来西亚）**；工具本身不绑定 region，使用 CloudShell 所在的 region |
 | AZ | **固定 2 个**，部署时按 GPU 有没有货自动选择（§4）。马来西亚实测结果：apse5-az1 + apse5-az2 |
 | GPU 机型 | 按 **GPU profile** 自动选择（§3.4）。马来西亚：g7e.2xlarge（仅 az2）为主，g6.12xlarge（TP=2）回退 |
 | 非 GPU 业务 | 集群自带通用 CPU 节点池，客户的普通 Pod 默认调度到这里，不需要额外提问（§3.3 `general_nodes`） |
-| 可观测性展示 | 已启用 IdC → Grafana（AMG）；未启用 → CloudWatch，之后可以用一条命令切到 Grafana（§5） |
-| 最少副本数默认值 | 2（每个 AZ 一个） |
+| 可观测性展示 | 设计：已启用 IdC → Grafana（AMG）；未启用 → CloudWatch，之后可以用一条命令切到 Grafana（§5）。**当前版本尚未实现**，现在能用的手段见 [04 §6](04-architecture-and-operations.md#6-可观测性如何使用) |
+| 最少副本数默认值 | 2（尽量每个 AZ 一个；马来西亚的 g7e 只在 apse5-az2，两个主力副本会在同一个 AZ） |
 
 ---
 
@@ -45,6 +45,7 @@
      cdk-deps      安装 CDK 运行依赖（npm ci --omit=dev）
      cdk-bootstrap 只有首次需要
      cdk-deploy    CloudFormation：网络栈 + EKS 栈（集群、系统节点组、核心 add-on、Karpenter IAM）
+                   + 推理服务栈（模型桶、vLLM 和同步 Job 的 Pod Identity 角色）
      kubeconfig    写到 ~/.qwenctl/<name>/kubeconfig（不覆盖客户自己的 ~/.kube/config）
      karpenter     helm 安装 karpenter-crd + karpenter（跑在系统节点上）
      nodepools     kubectl 创建 EC2NodeClass / NodePool：通用 CPU + 每个 GPU profile 一个
@@ -75,7 +76,7 @@
 - `--resume` 会重新校验保存的配置，并确认当前登录的账号和 region 与部署一致。
 - 本地文件（`~/.qwenctl/` 下的配置、状态、kubeconfig、Helm values）只有本人可读写。
 - 推理服务：命名空间强制 Pod Security `baseline`；容器去掉全部 capabilities、启用 seccomp RuntimeDefault；权重同步 Job 以非 root 运行。**已知例外**：vLLM 容器暂时以 root 运行（确认镜像在非 root 下的缓存目录和 NCCL 行为后再收紧）。
-- 权重完整性：同步时逐文件对比 HF 公布的哈希；之后的「跳过」判断信任 S3 对象元数据。信任边界是能写模型桶的主体（只有同步 Job 的角色，vLLM 只读），模型桶开启了版本控制，可以回滚。
+- 权重完整性：同步时逐文件对比 HF 公布的哈希；之后的「跳过」判断信任 S3 对象元数据。信任边界是能写模型桶的主体（只有同步 Job 的角色，vLLM 只读）。模型桶开启了版本控制，被覆盖的旧版本保留 7 天，7 天内可以回滚。
 - 编译缓存（S3 `compile-cache/`，torch.compile / Inductor / Triton 产物）：**里面有生成的代码**，被投毒等于在之后所有 vLLM Pod 里执行代码，而且会一直持续（新节点、重启都会加载）。所以 vLLM 的角色对它**只读**，只有部署者（qwenctl 用 CloudShell 里的凭证）在 serving 阶段写入：从刚就绪的 Pod 打包，校验压缩包（只能是普通文件和目录、不能指向目录外、数量和大小有上限），用条件写入（不覆盖已有缓存）上传。key 按配置计算（镜像 digest、模型 revision、profile、vLLM 参数），不信任 Pod 上可改的 label / annotation，否则命名空间里能改 Pod 的人可以借部署者的凭证往桶里任意位置写。恢复端（initContainer）同样只放行普通文件和目录、限制大小，任何失败都退回冷编译，不会挡住启动。vLLM 镜像里是 Python 3.12.3，早于修复 tarfile `data` 过滤器绕过的 3.12.11（CVE-2025-4517 等）。这些绕过都要借助链接，恢复端拒绝所有链接，所以不受影响。模型前缀和缓存前缀不能互相包含（同步 Job 能写模型前缀）。**剩余窗口**：被保存的 Pod 在就绪后的几秒里已经开始接流量。要清掉缓存，删除 `compile-cache/<profile>/` 下的对象即可（下次冷启动重新编译，下次 `--update` 重新保存）。
 - 扩缩容：KEDA 和 Prometheus 跑在系统节点上，命名空间强制 Pod Security baseline；Prometheus 只在集群内（ClusterIP），不对外写。扩缩容指标决定 GPU 副本数（也就是成本），所以 Prometheus **只加载两个可信命名空间里的监控对象**：推理命名空间（vLLM 的 PodMonitor）和 monitoring（kube-state-metrics）。客户业务命名空间里的 PodMonitor 或者规则加载不进来，没法伪造 `vllm:*` / `kube_pod_*` 指标。只抓 KEDA 要用的指标（不装 node-exporter，不抓 kubelet、API server、CoreDNS）。KEDA 只能读自己命名空间的 Secret。Deployment 的副本数交给单独的 field manager（`qwenctl-replicas`）持有，重跑 `--update` 不会把回退 profile 从 0 重置成 1。GPU 节点总数由每个 NodePool 的 GPU 上限兜底。注意主力和回退 profile 各自最多 maxReplicas 个副本，同时打满时成本是两者之和。能在推理命名空间创建 Pod 的主体（集群管理员级别）可以造一个调度不上的 `vllm-<profile>-*` Pod 来触发回退扩容，上限仍是 maxReplicas。**生产加固待做**：chart 里的镜像改为 digest 引用或者同步到客户 ECR；用 NetworkPolicy 限制只有 KEDA 能访问 Prometheus；用 RBAC 收紧推理命名空间的写权限。
 - vLLM 目前没有认证，Service 只在集群内（ClusterIP）。**交付客户前必须**加网关 + API Key，并开启 VPC CNI 的网络策略执行、只放行网关（计划在网关阶段完成）。
@@ -85,7 +86,7 @@
 | 工具 | 来源 | 校验 |
 |---|---|---|
 | kubectl v1.36.6、helm v3.22.1 | 官方下载地址，放到 `~/.qwenctl/bin/`（按版本命名，多个部署共用） | sha256 写在 `versions.json` 里（发布时确定），不从下载源现取，下载源被篡改也能发现 |
-| Karpenter chart 1.15.1 | `oci://public.ecr.aws/karpenter` | 先 `helm pull`，按 `versions.json` 里的 sha256 校验 chart 包，再从本地文件安装（tag 可以被重新推送）；pull 时使用隔离的 registry 配置，避免本机残留的过期 public.ecr.aws 登录导致 403（实测遇到） |
+| Helm chart：Karpenter 1.15.1（`oci://public.ecr.aws/karpenter`）、kube-prometheus-stack 92.17.1、KEDA 2.21.0（官方 https 仓库） | 各自的官方仓库 | 先 `helm pull`，按 `versions.json` 里的 sha256 校验 chart 包，再从本地文件安装（tag 可以被重新推送）；pull 时使用隔离的 registry 配置，避免本机残留的过期 public.ecr.aws 登录导致 403（实测遇到） |
 | CDK | 交付包里的 `infra/`（预编译的 `dist/` + `package-lock.json`） | `npm ci --ignore-scripts` 按 lock 文件安装（依赖的安装脚本会带着执行人的凭证运行，CDK 不需要） |
 
 所有锁定版本都在仓库根目录的 `versions.json`，Python 和 CDK 共用。
@@ -112,11 +113,13 @@ $ ./qwenctl deploy
 → 开始分阶段安装（cdk-deploy → karpenter → nodepools …）；断线后运行 ./qwenctl deploy --resume
 ```
 
+> 上面是设计阶段的示意（us-east-1 的例子）。实际界面按客户所在 region 显示；问题 2（访问方式）和问题 4（可选能力）的回答**会保存，但在当前版本还不生效**（网关和可观测性阶段接入），见 §3.1 的「状态」列。
+
 原则：
 - **先检查再提问**。能列出选项的就不让客户手输（VPC、证书都从列表里选）。
 - **每个问题都有默认值**，客户全部按回车也能部署成功。
 - **涉及成本的问题当场显示金额**。
-- 第一次的回答会保存下来。之后运行 `./qwenctl deploy --yes` 不会再问任何问题。
+- 第一次的回答会保存下来。之后用 `./qwenctl deploy --update` 或 `--resume`，不会再问任何问题。**不要对已有部署再运行不带参数的 `deploy` 或 `deploy --yes`**：它们会重新生成配置并覆盖保存的回答（[04 §5.1](04-architecture-and-operations.md#51-部署续跑更新)）。
 
 ---
 
@@ -124,12 +127,12 @@ $ ./qwenctl deploy
 
 ### 3.1 必问（4 个，加只在特定选项下出现的追问）
 
-| # | 问题 | 选项（粗体为默认） | 追问 | 为什么必须问 |
-|---|---|---|---|---|
-| 1 | 网络 | **新建 VPC** / 使用现有 VPC | 选现有 VPC → 列出 VPC 让客户选；私有子网自动筛选（有 `0.0.0.0/0` 指向 NAT/TGW 的路由，并且在 §4 选出的 2 个 AZ 里），客户确认即可 | 制造业客户常有 Landing Zone，SCP 可能禁止新建 VPC 或 IGW，或者要通过 TGW/DX 连工厂网络，脚本猜不出来 |
-| 2 | API 访问方式 | **仅 VPC 内部（internal ALB）** / 公网 HTTPS | 选公网 → 从当前 region 状态为 ISSUED 的 ACM 证书里选一个，再填来源 CIDR 白名单（不填会提示风险）。选内部 → 提示用 `qwenctl test` 在集群内验证 | 要不要暴露到公网是安全决策；公网 TLS 需要客户自己的域名和证书 |
-| 3 | 副本数 | 最少 **2**；最多 **min(8, 配额上限)** | — | 这是成本的大头，需要客户自己定 |
-| 4 | 可选能力 | **[x] 异步通道（SQS）** [ ] Bedrock 溢出；告警邮箱（可不填） | 勾选 Bedrock → 再确认一次，并检查当前 region 能不能用这个模型。填了邮箱 → 提示客户去邮箱确认 SNS 订阅 | Bedrock 溢出意味着数据会进 Bedrock、换成另一个模型，需要客户明确同意 |
+| # | 问题 | 选项（粗体为默认） | 追问 | 为什么必须问 | 状态 |
+|---|---|---|---|---|---|
+| 1 | 网络 | **新建 VPC** / 使用现有 VPC | 选现有 VPC → 列出 VPC 让客户选；私有子网自动筛选（有 `0.0.0.0/0` 指向 NAT/TGW 的路由，并且在 §4 选出的 2 个 AZ 里），客户确认即可 | 制造业客户常有 Landing Zone，SCP 可能禁止新建 VPC 或 IGW，或者要通过 TGW/DX 连工厂网络，脚本猜不出来 | ✅ 生效（新建 VPC 已实测；现有 VPC 有单元测试，未实测） |
+| 2 | API 访问方式 | **仅 VPC 内部（internal ALB）** / 公网 HTTPS | 选公网 → 从当前 region 状态为 ISSUED 的 ACM 证书里选一个，再填来源 CIDR 白名单（不填会提示风险）。选内部 → 提示用 `qwenctl test` 在集群内验证 | 要不要暴露到公网是安全决策；公网 TLS 需要客户自己的域名和证书 | ⏳ 会保存，网关阶段生效。当前服务只在集群内 |
+| 3 | 副本数 | 最少 **2**；最多 **min(8, 配额上限)** | — | 这是成本的大头，需要客户自己定 | ✅ 生效（主力 profile 的 min/max；回退 profile 的 max） |
+| 4 | 可选能力 | **[x] 异步通道（SQS）** [ ] Bedrock 溢出；告警邮箱（可不填） | 勾选 Bedrock → 再确认一次，并检查当前 region 能不能用这个模型。填了邮箱 → 提示客户去邮箱确认 SNS 订阅 | Bedrock 溢出意味着数据会进 Bedrock、换成另一个模型，需要客户明确同意 | ⏳ 会保存，暂不生效（马来西亚没有可用的 Bedrock 模型） |
 
 > 配额上限 =（G/VT On-Demand 配额 − 账号里已经在运行的 G/VT 实例占用的 vCPU）÷ 8，按 2xlarge 计算。
 
@@ -141,31 +144,34 @@ $ ./qwenctl deploy
 | AZ（2 个） | 见 §4 |
 | GPU 机型 | 按 profile 优先级（g7e > g6e > g6-tp2）取当前 AZ 里有货的；主力机型只在一个 AZ 时给出警告 |
 | 终端节点计划 | 查 VPC 里已有的终端节点、哪些路由表已经接了 S3、每个服务在哪些 AZ 提供，算出要建的清单（§4.1） |
-| G 配额 | Service Quotas `L-DB2E81BA`。不够时显示差多少，询问是否帮忙提交提额申请 |
-| 已有的容量预留（ODCR） | 按机型和选中的 AZ 查。找到了就提示可以给常驻副本用 |
-| 可观测性展示层 | 检测 IdC：已启用 → Grafana，再问一个管理员用户名；未启用 → CloudWatch（§5） |
-| 部署名前缀 | 默认 `qwen-vl`，只有和已有部署重名时才让客户改 |
+| G 配额 | Service Quotas `L-DB2E81BA`。不够时显示差多少，并给出提额申请的 `aws service-quotas` 命令（不会自动提交） |
+| 已有的容量预留（ODCR） | 按机型和选中的 AZ 查，找到了只做提示。当前版本的 EC2NodeClass 还没有配置容量预留选择器，Karpenter 不会主动使用 ODCR |
+| 可观测性展示层 | 检测 IdC：已启用 → Grafana，再问一个管理员用户名；未启用 → CloudWatch（§5）。当前版本只检测和展示，展示层尚未实现 |
+| 部署名前缀 | 默认 `qwen-vl`，可以用 `--name` 指定。设计是和已有部署重名时提示客户；**当前的重名检测无效**（已知问题） |
 | 新 VPC 的 CIDR | 默认 `10.100.0.0/16` |
-| 模型 | 默认 Qwen3.5-35B-A3B-FP8。部署时不问，以后换 Qwen3.6 用 `qwenctl model switch` |
+| 模型 | 默认 Qwen3.5-35B-A3B-FP8（锁定在 `versions.json`）。部署时不问；换模型的 `qwenctl model switch` 还没有实现 |
 | CDK bootstrap | 已有 → 直接用；没有 → 征得客户同意后执行 |
 
 ### 3.3 高级配置（`config.yaml`，全部可选，不写就用默认值）
+
+> 下面每一项都会被校验，写错会直接报错。但其中一部分在当前版本**还没有接入，填了也不生效**，已在注释里标为「（未生效）」。部署后要修改，改 `~/.qwenctl/<name>/config.json` 里的 `advanced` 部分，再运行 `./qwenctl deploy --update`（见 [04 §4.8](04-architecture-and-operations.md#48-可以调的参数)）。
 
 ```yaml
 serving:
   max_model_len: 32768
   max_images_per_request: 4
-  max_image_pixels: 2097152          # 约 2 MP
+  max_image_pixels: 2097152          # 约 2 MP（未生效：还没有传给 vLLM，网关阶段统一校验）
   gpu_memory_utilization: 0.92
+  max_num_seqs: 128                  # 单副本最大并发序列（和 GPU profile 的上限取较小者）
 scaling:
-  c_sla: {}                          # key 是 GPU profile 名（如 g7e-1gpu: 40）；为空时用内置的占位值，压测后用 qwenctl tune 写入实测值
+  c_sla: {}                          # key 是 GPU profile 名（如 g7e-1gpu: 40）；为空时用内置的占位值。压测后手工写入实测值（qwenctl tune 未实现）
   target_utilization: 0.65
   waiting_threshold: 4
-  kv_cache_threshold: 0.8
-  warm_node_minutes: 10
-  schedule: null                     # 定时预扩容，默认关闭。例：{timezone: Europe/Berlin, start: "0 8 * * 1-5", end: "0 18 * * 1-5", replicas: 4}
+  kv_cache_threshold: 0.8            # （未生效：KV 使用率触发器还没有接入）
+  warm_node_minutes: 10              # 空闲 GPU 节点保留多久（保温）
+  schedule: null                     # 定时预扩容（未生效）。例：{timezone: Europe/Berlin, start: "0 8 * * 1-5", end: "0 18 * * 1-5", replicas: 4}
 capacity:
-  extra_fallback_types: []           # 例：[p5.4xlarge]，作为 ICE 时的第三档回退
+  extra_fallback_types: []           # 例：[p5.4xlarge]，作为 ICE 时的第三档回退（未生效）
 general_nodes:                       # 通用 CPU 节点池（客户的非 GPU 业务）
   arch: [amd64]                      # 确认业务镜像支持 arm64 后可以加上 arm64（Graviton 更便宜）
   capacity_types: [on-demand]        # 业务能容忍中断时可以加上 spot
@@ -176,32 +182,33 @@ network:
   eks_endpoint: public-and-private   # 或 private（这时客户要用 CloudShell VPC 环境执行 kubectl）
   interface_endpoints: auto          # auto = 新建 VPC 时创建、现有 VPC 时不创建；on / off 强制（§4.1）
 compliance:
-  kms_key_arn: null                  # 客户自己的 CMK（密钥策略要允许 logs 等服务使用）；为空时用 AWS 托管加密
+  kms_key_arn: null                  # 客户自己的 CMK（密钥策略要允许 logs 等服务使用）；为空时用 AWS 托管加密。GPU 节点的镜像层和临时存储在实例存储（NVMe）上，由 Nitro 硬件加密，不受 CMK 约束
   tags: {}                           # 客户 tag policy/SCP 要求的强制标签
   extra_admin_role_arns: []
 observability:
-  amp: auto                          # auto = 只在 Grafana 模式下启用；on = CloudWatch 模式下也提前写入 AMP
-  log_retention_days: {app: 14, access: 30, coldstart: 90}
+  amp: auto                          # auto = 只在 Grafana 模式下启用；on = CloudWatch 模式下也提前写入 AMP（未生效）
+  log_retention_days: {app: 14, access: 30, coldstart: 90}   # 当前只有 access 生效：EKS 控制面日志和 VPC Flow Logs 的保留期
 image:
-  source_registry: docker.io         # Docker Hub 匿名拉取有限流（集群出口 NAT 的 IP 也可能和其他业务共享）
-  credentials_secret_arn: null
+  source_registry: docker.io         # （未生效）Docker Hub 匿名拉取有限流（集群出口 NAT 的 IP 也可能和其他业务共享）
+  credentials_secret_arn: null       # （未生效）
 cdk:
   bootstrap_qualifier: null
 ```
 
-### 3.4 锁定，不开放修改（`versions.lock`）
+### 3.4 锁定，不开放修改（`versions.json`）
 
-- K8s、Karpenter、KEDA、Envoy AI Gateway、vLLM `v0.32.0`、Bottlerocket、各 Helm chart 的版本
+- K8s 1.36、EKS add-on、Bottlerocket v1.68.1、kubectl / helm、各 Helm chart（Karpenter、kube-prometheus-stack、KEDA）的版本和 sha256，vLLM `v0.32.0` 的镜像 digest，模型 revision
 - **GPU profile**（`cli/qwenctl/catalog.py`）：每种 GPU 机型对应的 TP 大小、每节点副本数、NodePool weight，详见 [01 §2.3](01-architecture-design.md#23-马来西亚ap-southeast-5实测2026-11-03)
 - 节点分层：系统节点（托管节点组，带 `CriticalAddonsOnly` 污点）、通用 CPU 节点（不带污点）、GPU 节点（带 `nvidia.com/gpu` 污点），见 [01 §3.1](01-architecture-design.md#31-节点分层gpu-推理和客户业务共用一个集群)
 - IAM 策略、安全组规则、加密、S3 Block Public Access、IMDSv2
 - 不记录 prompt；健康检查参数和优雅下线参数
 
-原因：这是验证过的组合，开放出去要支持的情况会多到管不过来。升级时发布新版本的交付包，同时重建 EBS 快照和编译缓存。
+原因：这是验证过的组合，开放出去要支持的情况会多到管不过来。升级时发布新版本的交付包；编译缓存的 key 包含镜像 digest 和模型 revision，升级后第一个副本会重新编译，`--update` 时自动保存新缓存。
 
 ### 3.5 自动生成，不问
 
-API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 SSM）、编译缓存在 S3 上的路径。
+- 已实现：模型桶名（CloudFormation 生成）、权重和编译缓存在 S3 上的路径、K8s 资源名（命名约定见 [04 附录](04-architecture-and-operations.md#附录命名约定)）。
+- 计划中：API Key（存 Secrets Manager）、ECR 仓库名、EBS 快照 ID（存 SSM）。
 
 ---
 
@@ -212,7 +219,7 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 2. 用 `describe-instance-type-offerings` 查每个 AZ 里各个 GPU profile 的代表机型有没有货。
 3. 打分：先比 AZ 里最高档的 profile，再比可用的 profile 数量。例如「g7e + g6」排在「只有 g6」前面。如果用现有 VPC，只考虑有合格私有子网的 AZ。
 4. 取分数最高的 2 个；同分时按 AZ ID 排序，保证每次结果一样。
-5. 只有 1 个 AZ 有 GPU 时：警告「GPU 副本只能放在一个 AZ 里」，客户确认后继续（ALB 和系统节点仍然跨 2 个 AZ）。一个都没有时：退出，并列出有货的 region。
+5. 只有 1 个 AZ 有 GPU 时：警告「GPU 副本只能放在一个 AZ 里」，客户确认后继续（系统节点仍然跨 2 个 AZ）。一个都没有时：退出（设计是同时列出有货的 region，当前版本还没有做）。
 
 **实现要点**
 - 程序内部始终用 **AZ ID**（例如 `use1-az4`），展示时同时显示 AZ 名。同一个 AZ 名在不同账号里对应的物理 AZ 不一样，01 文档里写的 `1a/1c/1d` 是我们自己账号的结果，不能直接用。
@@ -244,6 +251,8 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 
 ## 5. 可观测性展示层
 
+> **状态**：设计已确认，当前版本**尚未实现**（只检测 IdC 并在确认页展示结果）。现在能用的观测手段见 [04 §6](04-architecture-and-operations.md#6-可观测性如何使用)。
+
 - 规则：本 region 有 AMG 且客户已启用 IdC → Grafana 模式；否则 → CloudWatch 模式。
 - **马来西亚没有 AMG**，所以默认是 CloudWatch 模式。以后切 Grafana 的方案待定（01 §13 第 8 条）：在新加坡建 AMG 跨 region 查询，或者在集群内自建 Grafana。
 - 两种模式的**采集层完全一样**，只有展示层不同。CloudWatch 模式切到 Grafana 只需要 `qwenctl observability grafana`，只往上加组件，不重建集群，也不中断推理。
@@ -256,11 +265,11 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | 检查项 | 不通过时 |
 |---|---|
 | 身份和权限 | 用 `iam simulate-principal-policy` 抽查关键操作。权限不够就列出缺的权限并退出。SCP 的拦截无法提前判断，部署时如果报错会给出提示 |
-| GPU 有没有货 | 一个 AZ 都没有 → 退出，列出有货的 region；只有一个 AZ → 警告并让客户确认 |
-| G/VT 配额 | 不够 → 显示差多少，可以帮忙提交提额申请；同时把最多副本数压到当前配额允许的范围 |
-| VPC、EIP 配额（新建 VPC 时） | 不够 → 退出，并告诉客户要提哪个配额 |
+| GPU 有没有货 | 一个 AZ 都没有 → 退出（当前版本不会列出有货的 region）；只有一个 AZ → 警告并让客户确认 |
+| G/VT 配额 | 不够 → 显示差多少，给出提额申请命令；同时把最多副本数压到当前配额允许的范围（按主力机型计算，见 [04 §4.6](04-architecture-and-operations.md#46-配额和副本数上限)） |
+| VPC、EIP 配额（新建 VPC 时） | 设计：不够 → 退出，并告诉客户要提哪个配额。**当前版本未检查**，配额不够时会在 CloudFormation 阶段报错 |
 | CDK bootstrap | 没有 → 征得同意后执行；客户有自定义 qualifier → 从 `config.yaml` 读取 |
-| 同名部署 | 已经存在 → 进入更新流程，或者让客户换个名字 |
+| 同名部署 | 设计：已经存在 → 进入更新流程，或者让客户换个名字。**当前版本检测无效**（已知问题），对已有部署请直接用 `--update` |
 | ACM 证书（选公网时） | 没有 ISSUED 状态的证书 → 提示先申请，或者改用内部访问 |
 | Bedrock 模型（勾选溢出时） | 当前 region 用不了 → 自动取消勾选并提示 |
 | IdC | 只用来决定展示层，不会让检查失败 |
@@ -270,16 +279,17 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 
 ## 7. 命令一览
 
-| 命令 | 作用 |
-|---|---|
-| `deploy` | 首次部署。`--resume` 从中断处继续；`--update` 用保存的配置重新执行全部阶段；`--plan` 只生成配置；`--yes --approve` 无人值守部署 |
-| `status` | 当前阶段、各组件状态、访问地址、获取 API Key 的命令 |
-| `test` | 在集群内发测试请求（选了内部访问时用它验证） |
-| `scale --min N --max M` | 调整副本范围，会按配额校验 |
-| `tune` | 压测后写入 `C_sla` 等扩缩容参数 |
-| `model switch <preset>` | 换模型：同步新权重，然后滚动更新 |
-| `observability grafana` | 从 CloudWatch 模式切到 Grafana 模式 |
-| `destroy` | 先把 Karpenter 节点缩到 0 并等实例终止，再删除各个栈；EBS 快照、ECR 镜像、S3 数据删除前逐项确认 |
+| 命令 | 作用 | 状态 |
+|---|---|---|
+| `preflight` | 只做环境检查（只读） | ✅ |
+| `deploy` | 首次部署。`--resume` 从中断处继续；`--update` 用保存的配置重新执行全部阶段；`--plan` 只生成配置；`--yes --approve` 无人值守部署 | ✅ |
+| `status` | 当前阶段、各组件状态、访问地址、获取 API Key 的命令 | ⏳ 临时用 [04 §6.2](04-architecture-and-operations.md#62-日常巡检) 的命令 |
+| `test` | 在集群内发测试请求（选了内部访问时用它验证） | ⏳ 临时用 `e2e/infer_test.py`（[04 §5.2](04-architecture-and-operations.md#52-调用推理服务)） |
+| `scale --min N --max M` | 调整副本范围，会按配额校验 | ⏳ 临时做法见 [04 §5.4](04-architecture-and-operations.md#54-调整副本范围扩缩容参数scale-命令上线前的临时做法) |
+| `tune` | 压测后写入 `C_sla` 等扩缩容参数 | ⏳ |
+| `model switch <preset>` | 换模型：同步新权重，然后滚动更新 | ⏳ |
+| `observability grafana` | 从 CloudWatch 模式切到 Grafana 模式 | ⏳ |
+| `destroy` | 先把 Karpenter 节点缩到 0 并等实例终止，再删除各个栈；EBS 快照、ECR 镜像、S3 数据删除前逐项确认 | ⏳ 临时做法见 [04 §5.6](04-architecture-and-operations.md#56-清理环境destroy-命令上线前的临时做法) |
 
 > 为什么 `destroy` 要先缩节点：Karpenter 创建的 GPU 实例不在 CloudFormation 的管理范围里。直接删栈会留下没人管的实例继续计费，VPC 也会因为还有网卡而删不掉。
 
@@ -287,12 +297,16 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 
 ## 8. 配置和状态存在哪里
 
+**当前版本**：
+
 | 内容 | 位置 | 说明 |
 |---|---|---|
-| 完整配置（交互回答和 `config.yaml` 合并后的结果） | artifacts 桶 `config/<name>.yaml`，开启版本控制 | 每次部署用的配置都能查到；换一个人的 CloudShell 也能读到 |
-| 部署进度、快照 ID、桶名等 | SSM Parameter Store `/<name>/...` | 数据量小，读写频繁 |
-| 本地缓存 | `$HOME/.qwenctl/` | 只是缓存，丢了可以从 S3 和 SSM 恢复 |
-| API Key | Secrets Manager | `qwenctl status` 只显示获取命令，不打印明文 |
+| 完整配置（交互回答和 `config.yaml` 合并后的结果） | `~/.qwenctl/<name>/config.json` | **只有这一份**，`--resume` / `--update` 都靠它。请自行备份（[04 §5.1](04-architecture-and-operations.md#51-部署续跑更新)） |
+| 部署进度 | `~/.qwenctl/<name>/state.json` | 丢了也没关系，`--update` 会重新执行所有阶段 |
+| kubeconfig、Helm values、chart 缓存 | `~/.qwenctl/<name>/`、`~/.qwenctl/charts/` | 只有本人可读写 |
+| AWS 资源 | CloudFormation 栈 `<name>-network` / `-eks` / `-serving` | 栈的输出（桶名等）每次都从 CloudFormation 读取 |
+
+**计划中**：配置存到 artifacts 桶 `config/<name>.yaml`（开启版本控制，换一个人的 CloudShell 也能读到），快照 ID 等存到 SSM Parameter Store `/<name>/...`，API Key 存 Secrets Manager（`qwenctl status` 只显示获取命令，不打印明文）。届时本地只是缓存。
 
 ---
 
@@ -303,137 +317,13 @@ API Key（存 Secrets Manager）、桶名、ECR 仓库名、EBS 快照 ID（存 
 | `qwenctl preflight`：环境检查（只读） | ✅ 已在 ap-southeast-5 实测 | `cli/qwenctl/preflight.py`、`aws_gateway.py` |
 | `qwenctl deploy`：4 个问题 + 确认页 + 保存配置 | ✅ | `cli/qwenctl/questions.py`、`render.py`、`store.py` |
 | 部署配置契约（Python → CDK） | ✅ zod 校验 + 契约测试 | `cli/qwenctl/models.py`、`infra/lib/config.ts`、`infra/test/contract.test.ts` |
-| CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ synth 通过，未部署 | `infra/lib/network-stack.ts` |
-| CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ synth 通过，未部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
-| 客户端安装流程（11 个阶段、断点续跑、锁定版本工具） | ✅ **已在 ap-southeast-5 真实部署验证**（见 §9.1） | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
-| 推理服务层：模型桶 + Pod Identity（CDK），权重同步 Job、每个 GPU profile 一个 vLLM Deployment（Run:ai Streamer 从 S3 加载） | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.2） | `infra/lib/serving-stack.ts`、`cli/qwenctl/serving.py`、`assets/model_sync.py` |
-| 弹性伸缩：集群内 Prometheus + KEDA，主力按负载扩缩容，回退 profile 在主力没货时自动扩出 | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.3） | `cli/qwenctl/platform.py`、`autoscaling.py` |
-| 冷启动：GPU 节点 NVMe RAID0 + SOCI 并行拉取、编译缓存放 S3 | ✅ 已在 ap-southeast-5 真实部署验证（见 §9.4），新节点扩容 6 分 02 秒 → 3 分 38 秒 | `cli/qwenctl/manifests.py`、`compile_cache.py`、`assets/compile_cache_restore.py` |
-| 网关、可观测性栈、镜像预缓存 | ⏳ | — |
+| CDK 网络栈（新建 / 现有 VPC + 终端节点） | ✅ 新建 VPC 已真实部署；现有 VPC 只有单元测试 | `infra/lib/network-stack.ts` |
+| CDK EKS 栈（集群 1.36、系统节点组、核心 add-on、Karpenter IAM 和中断队列） | ✅ 已真实部署 | `infra/lib/eks-stack.ts`、`karpenter-iam.ts` |
+| 客户端安装流程（11 个阶段、断点续跑、锁定版本工具） | ✅ 已真实部署 | `cli/qwenctl/installer.py`、`toolchain.py`、`manifests.py` |
+| 推理服务层：模型桶 + Pod Identity，权重同步 Job，每个 GPU profile 一个 vLLM Deployment（S3 流式加载） | ✅ 已真实部署 | `infra/lib/serving-stack.ts`、`cli/qwenctl/serving.py`、`assets/model_sync.py` |
+| 弹性伸缩：集群内 Prometheus + KEDA，主力按负载扩缩容，主力没货时自动回退 | ✅ 已真实部署（按负载扩缩容还没有压测） | `cli/qwenctl/addons.py`、`autoscaling.py` |
+| 冷启动：GPU 节点 NVMe RAID0 + SOCI 并行拉取、编译缓存放 S3 | ✅ 已真实部署，新节点 6 分 02 秒 → 3 分 38 秒 | `cli/qwenctl/manifests.py`、`compile_cache.py`、`assets/compile_cache_restore.py` |
+| 网关（API Key）、可观测性（CloudWatch 模式）、镜像预缓存 / ECR | ⏳ | — |
 | `status` / `test` / `scale` / `destroy` 等命令 | ⏳ | — |
 
-测试：Python 342 个（3.9 和 3.12 都跑，覆盖率 98%）；CDK 52 个。部署前的安全评审：2026-11-03 没有 CRITICAL/HIGH，5 个 MEDIUM 和 5 个 LOW 已全部修复；2026-11-04（弹性伸缩）没有 CRITICAL/HIGH，3 个 MEDIUM 和 8 个 LOW 修复了 10 个。没修的 1 个 LOW：副本数交接遇到冲突时不自动重试，apply 会安全失败，`--resume` 重跑即可；2026-11-04（冷启动 / 编译缓存）没有 CRITICAL/HIGH，2 个 MEDIUM 和 6 个 LOW 修复了 7 个。没做的 1 个 LOW：桶策略里显式拒绝部署者以外的主体写 `compile-cache/`，留到生产加固。代码评审的 2 个 HIGH 也已修复：恢复时网络中断要清空目录；写盘失败时要回收子进程、删掉临时文件。
-
-### 9.1 端到端验证（2026-11-03，ap-southeast-5，`./qwenctl deploy --yes --approve`）
-
-| 阶段 | 结果 | 耗时 |
-|---|---|---|
-| cdk bootstrap | ✅（第一次失败：`cdk bootstrap` 在 `infra/` 下会先执行 app，没传部署配置；修复后用 `--resume` 续跑成功） | ~1 分钟 |
-| 网络栈 | ✅ VPC、2 AZ 子网、NAT、S3 网关 + 5 个接口终端节点、Flow Logs | ~3 分钟 |
-| EKS 栈 | ✅ 集群 1.36、2 × m7g.large Bottlerocket 系统节点（IMDSv2 hop 1、EBS 加密已核实）、5 个 add-on 全部 ACTIVE | ~11 分钟 |
-| Karpenter + 节点池 | ✅ chart sha256 校验通过；2 个控制器副本分布在两个 AZ；EC2NodeClass general/gpu 都 Ready；3 个 NodePool Ready | ~2 分钟 |
-| **合计** | | **~17 分钟** |
-
-**非 GPU 业务（通用节点池）**：部署 2 个 nginx 副本（不带任何 nodeSelector / toleration）
-- 扩容：**37 秒**从 apply 到 Pod Ready。Karpenter 启动 c7i-flex.large（x86、按需、apse5-az2），09:18:51 创建 → 09:18:54 启动 → 09:19:03 注册 → 09:19:21 就绪
-- 缩容：删除业务后 **130 秒**节点被回收（空闲 1 分钟 + 驱逐和终止）
-
-**GPU 节点（GPU 节点上限 2 台：g7e 节点池上限 1 GPU、g6 节点池上限 4 GPU）**
-- **g7e.2xlarge 没货**：apse5-az2 连续 4 次 `InsufficientInstanceCapacity`（09:41~09:52）。马来西亚 g7e 只在这一个 AZ，没有地方可换
-- **回退生效**：不指定机型的 GPU Pod → Karpenter 跳过 g7e，按 weight 选 g6-tp2 → 09:52:39 启动 g6.12xlarge（apse5-az1）→ **46 秒**从 Pod 创建到 Running
-- 驱动：Bottlerocket 1.68.1 NVIDIA 变体 = **580.178.04 / CUDA 13.0**，L4 正常识别。R580 官方支持 Blackwell，g7e 大概率可用，**但还没有在 g7e 实机上验证**
-
-**vLLM 冷启动基线（未优化：镜像直接从 Docker Hub，权重直接从 HF；g6.12xlarge TP=2，节点已就绪）**
-
-| 阶段（01 §4.1 / 02 §2.1） | 耗时 | 说明 |
-|---|---|---|
-| H 镜像拉取 | 91 s | `vllm/vllm-openai:v0.32.0`，9.2 GB |
-| J 进程启动、NCCL 初始化 | ~58 s | |
-| K 权重：下载 + 加载 | 137 s + 12 s | HF 下载约 270 MB/s；加载每卡 17.13 GiB |
-| L 编译 | 31.5 s | torch.compile（缓存未命中） |
-| M Engine 初始化 | 126 s（含编译） | CUDA graph 11 s；KV cache 每卡 1.29 GiB = 74,898 token，8K 上下文下最大并发 9.1 |
-| **Pod 创建 → Ready** | **7 分 17 秒** | 加上新节点启动（约 40 s）≈ 8 分钟；目标 ≤ 3 分钟 |
-
-可优化的空间（对应 01 §4）：权重放 S3 + Run:ai Streamer 可省掉约 2 分 20 秒的下载；EBS 快照预缓存镜像可省掉约 1.5 分钟；编译缓存放 S3 可省掉约 30 秒。
-
-**推理测试**（`max-model-len=8192`，`gpu-memory-utilization=0.92`，关闭 thinking）
-
-| 测试 | 结果 |
-|---|---|
-| 纯文本 | 0.55 s |
-| 设备铭牌图片 → JSON（7 个字段） | 2.14 s，全部识别正确（型号、序列号、功率、电压、频率、PASS） |
-| 8 路并发（每路 1 张图 + 128 token） | TTFT p50 0.47 s / max 0.64 s，墙钟 3.3 s，输出 311 tok/s |
-
-结论：g6.12xlarge TP=2 作为回退 profile 可用，KV 余量比预估的好（8K 上下文 9 路并发）。
-
-### 9.2 推理服务层验证（2026-11-04，`./qwenctl deploy --update`）
-
-**权重同步（HF → S3，一次性）**：37.5 GB / 27 个文件用了 418 s（约 90 MB/s），**逐文件哈希校验全部通过**（LFS 文件比对 sha256，其余比对 git blob sha1）。同步 Job 以非 root 运行，凭证来自 Pod Identity。同步 Pod 等了约 5.5 分钟才启动，原因是通用节点的 gp3 数据盘默认只有 125 MB/s，解压 9 GB 的 vLLM 镜像很慢（待优化）。
-
-**vLLM 从 S3 流式加载（g6.12xlarge TP=2，保温节点：节点已在、镜像已在）**
-
-| 阶段 | 今天 | 昨天基线 |
-|---|---|---|
-| 镜像 | 0 s（节点上已有） | 91 s |
-| 进程启动、TP worker、NCCL | ~60 s | ~58 s |
-| 权重 | **37 s**（Run:ai Streamer 从 S3 读取 31 s） | 137 s 下载 + 12 s 加载 |
-| torch.compile | 31 s（缓存未命中） | 31.5 s |
-| profiling、CUDA graph、KV cache | ~70 s | ~95 s |
-| **Pod 创建 → Ready** | **3 分 50 秒** | 7 分 17 秒 |
-
-**推理（经 Service `qwen-vl.qwen-vl.svc`）**：纯文本 0.56 s；铭牌图片 → JSON 2.11 s，7 个字段全部正确；8 路并发 TTFT p50 0.41 s，输出 332 tok/s。
-
-**真实部署里发现并修复的问题**
-- g6-tp2 用默认参数（32K 上下文、256 并发、4 张图）会在分配 KV cache 时失败（`No available memory for the cache blocks`）→ 每个 GPU profile 带自己的参数上限：g6-tp2 = 8K / 16 / 2 张图，g7e 用默认值（32K / 128 / 4 张图）
-- 旧版本保存的配置缺少新增的高级配置项（`max_num_seqs`）→ `--update` 迁移配置时合并高级配置的默认值，客户已填的值优先
-- g7e 仍然没有容量（ICE），回退当时要手工扩容 → 已改为由 KEDA 自动完成（见 §9.3）
-
-**离 ≤90 s（保温节点）/ ≤3 分钟（新节点）的目标还差**：编译缓存放 S3（约 30 s）、profiling 和 CUDA graph 的开销（约 70 s，可以调小 cudagraph capture size）、进程启动（约 60 s）。新节点还要加上节点启动（约 40 s）和镜像拉取（改用实例存储 RAID0 + ECR，或者 EBS 快照，待实测对比）。
-
-### 9.3 弹性伸缩验证（2026-11-04，`./qwenctl deploy --update` / `--resume`）
-
-**场景**：g7e 在 apse5-az2 仍然没有容量（ICE），主力 Pod 已经 Pending 了 24 分钟；回退 profile（g6-tp2）副本数为 0。安装 Prometheus + KEDA 后，**没有任何手工操作**：
-
-| 时间（UTC） | 事件 | 间隔 |
-|---|---|---|
-| 02:47:31 | qwenctl 创建 ScaledObject | — |
-| 02:47:32~42 | KEDA 的前两次查询被拒绝（Prometheus 刚启动）。`fallback: currentReplicasIfHigher` 生效：保持当前副本数，没有误缩容 | — |
-| 02:48:02 | KEDA：`Scaled vllm-g6-tp2 from 0 to 1, triggered by s0-prometheus`（「主力 Pod 创建超过 180 s 还调度不上」的数量 = 1） | 31 s |
-| 02:48:03 → 02:48:44 | Karpenter 创建 NodeClaim → g6.12xlarge 启动 → 注册 → Ready | 41 s |
-| 02:48:43 → 02:50:12 | 拉取 vLLM 镜像（9.2 GB，Docker Hub） | 89 s |
-| 02:50:12 → 02:51:45 | 进程启动 + 从 S3 流式加载权重（37 s） | 93 s |
-| 02:51:45 → 02:54:04 | profiling、KV cache、CUDA graph、torch.compile（31 s，缓存未命中） | 139 s |
-| **02:48:02 → 02:54:04** | **KEDA 触发 → 回退副本 Ready** | **6 分 2 秒** |
-
-新部署时还要加上主力 Pod 被判定为「调度不上」的 180 s，以及指标抓取和 KEDA 轮询（约 30 s）。所以主力没货时，**约 9.5 分钟后有回退副本在服务**。之后的主要优化空间在冷启动（下一阶段）：镜像预缓存约省 90 s，编译缓存约省 30 s，调小 CUDA graph capture size。
-
-**推理（回退副本）**：在集群内直接调用 vLLM（不经过 port-forward）：纯文本 0.55 s；铭牌图片 → JSON 1.16 s，7 个字段全部正确；8 路并发 TTFT p50 0.46 s，输出 314 tok/s；单路生成 400 token 约 13 ms/token。和第一天的数字一致。
-- **更正**：之前从测试机经 `kubectl port-forward` 测到的数字（纯文本 1.23 s、8 路并发 TTFT 2.1 s、209 tok/s）里，大部分是测试路径的开销：测试机在 us-east-1，port-forward 要绕到马来西亚的 API server（单是 TCP 建连就要 222 ms）。我一度以为是 decode 变慢了，原因是看错了服务端的平均 inter-token latency（它被 8 路并发的批次拉高）。GPU 没有降频（2040 MHz，60 W / 72 W），也和 P2P 无关（g6.12xlarge 上所有 GPU 对都不支持 P2P）。第一天和 §9.2 里的「铭牌图片 2.1 s」同样包含这部分开销，实际是 1.16 s。
-- 以后的性能数据一律在集群内测（或者经网关）。网关上线后客户也不会经过 port-forward。
-
-**真实部署里发现并修复的问题**
-- 同步 Job 的模板不可变：ConfigMap 改名后，同名 Job 的 apply 被拒绝 → Job 名改为对整个 Pod 模板求哈希；S3 上已有 `_COMPLETE` 标记就直接跳过（不用为了确认「已完成」去拉起 CPU 节点、拉 9 GB 镜像，约省 5 分钟）
-- Prometheus 的 StatefulSet 由 operator 异步创建，helm 不会等它 → metrics 阶段等 Prometheus CR `Available` 后才装 KEDA
-- **副本数被重置（安全评审发现，集群上复现）**：qwenctl 的 apply 省略 `replicas`（交给 KEDA）。但如果 `replicas` 只归 qwenctl 所有，server-side apply 会把它删掉、回到默认值 1。重跑 `--update` 时，回退 profile 会从 0 变成 1，白白拉起一台 GPU 节点。改为把 `replicas` 交给单独的 field manager。用临时 Deployment 验证过：不交接 0 → 1，交接后保持 0
-- **回退信号（代码评审发现）**：最初用的是「Pod Pending 超过 180 s」。但镜像拉取期间 Pod 也是 Pending（这次 g6 Pod 就 Pending 了 130 s，其中拉镜像 89 s），主力正常扩容时（新节点约 40 s + 拉镜像约 90 s）很容易超过 180 s，误扩出回退 GPU 节点。改为「调度不上」（`kube_pod_status_unschedulable`，即 PodScheduled=False / Unschedulable）：ICE 时一直是 1；有容量时 Karpenter 约 40 s 就能让 Pod 调度上。Pod 名改为精确匹配 `vllm-<profile>-<哈希>-<后缀>`，profile 名互为前缀（g6 / g6-tp2）时不会串。有 3 个以上 profile 时，回退按顺序接力（第二个看主力，第三个看第二个），不会同时扩出
-- 交接用的部分对象（只有 `replicas`）不能包在 `v1 List` 里一起 apply：kubectl 会在客户端按完整 Deployment 校验，因为缺 selector / template 而拒绝。改为逐个 apply 单个对象，由服务端校验合并后的结果；对象不存在时服务端照样拒绝，不会建出残缺的对象。重跑时 g6 副本一直在服务，没有重启
-- 安全评审的其他修复：Prometheus 只加载可信命名空间的监控对象；KEDA 不能读全集群的 Secret；去掉 node-exporter（它要 hostNetwork + hostPID 跑在每个节点上）；monitoring / keda 命名空间强制 PSA baseline；`waiting_threshold`、`c_sla` 和保存配置里的 GPU 数值加了范围校验
-
-### 9.4 冷启动优化：第一轮（2026-11-04，g6.12xlarge TP=2，镜像仍然从 Docker Hub 拉）
-
-两项改动，都不需要客户加参数：
-
-1. **GPU 节点：本地 NVMe + SOCI 并行拉取**。GPU EC2NodeClass 设 `instanceStorePolicy: RAID0`：Karpenter 把 NVMe 组成 RAID0，containerd、kubelet、Pod 临时存储都放上去。目录里的 GPU 机型都带 NVMe（g6.12xlarge 3.76 TB，g7e 1.9 TB）。EBS 数据盘从 150 GiB / 1000 MB/s / 16K IOPS 降到 30 GiB gp3 默认规格，也省了预置吞吐的钱。注意 g7e.2xlarge 的 EBS 带宽上限只有 625 MB/s，原来配的 1000 MB/s 用不满。Bottlerocket 的 SOCI snapshotter 开 parallel-pull-unpack 模式：每个镜像 20 路下载、16 MB 分块、4 路解压。这个模式不需要 SOCI index，默认参数很保守，必须调大。
-2. **编译缓存放 S3**。torch.compile、Inductor、Triton 的产物约 250 MB，压缩后 33 MB。第一个就绪的副本由 qwenctl 保存到 S3，之后的副本由 initContainer 恢复。initContainer 复用 vLLM 镜像，不多拉镜像。信任模型见 §1.3。
-
-| 阶段 | 基线 | + NVMe / SOCI | + 编译缓存 |
-|---|---|---|---|
-| 节点启动 → Ready | 41 s | 37 s | 36 s |
-| 拉镜像（9.2 GB） | 89 s | 54 s | 52 s |
-| 恢复编译缓存 | — | — | 3 s |
-| 进程启动 + 权重（S3 流式加载 37 s） | 93 s | 93 s | 84 s |
-| Engine 初始化 | 139 s | 134 s | **25 s** |
-| 其中 torch.compile / 首次 profiling（kernel JIT） | 31 s / 60 s | 31 s / 59 s | **0.5 s / 0.7 s** |
-| API server 启动 → Ready | ~13 s | ~9 s | 11 s |
-| **扩容触发 → 新节点上的副本 Ready** | **6 分 02 秒** | **5 分 19 秒** | **3 分 38 秒** |
-
-- 「首次 profiling 60 s」以前以为是 CUDA graph / KV cache，其实几乎全是 kernel JIT（Qwen3.5 的 GDN / MoE Triton kernel）。有缓存时只要 0.7 s。
-- 缓存按镜像 digest、模型 revision、profile、vLLM 参数分 key。改了其中任何一个，第一次冷启动会重新编译，部署时再保存一次。
-- 删 g6.12xlarge 节点时，EC2 的 `shutting-down` 要 7~8 分钟（大概在清理实例存储）。进入 shutting-down 就不再计费，只是 NodeClaim 要等到实例终止才消失。
-
-**离「新节点 ≤ 3 分钟」还差约 40 s**。剩下的大头：
-- 进程启动约 47 s，其中多模态预热 16 s；
-- 拉镜像 52 s：可以改成区域内的 ECR，或者预缓存到 EBS 快照，后者要实测快照的懒加载；
-- 权重 37 s。
-
-下一步按这个顺序试。
+测试数据（部署、节点池扩缩容、GPU 回退、冷启动各阶段、推理性能、安全评审、自动化测试）见 [05 测试报告](05-test-report.md)；架构和用法见 [04 架构与使用手册](04-architecture-and-operations.md)。

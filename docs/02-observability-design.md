@@ -1,8 +1,29 @@
 # 可观测性设计：冷启动全链路时间线 + 运行期指标/日志/追踪
 
-> 版本：v0.3 | 日期：2026-11-03 | 关联：[01-architecture-design.md](01-architecture-design.md)、[03-deployment-parameters.md](03-deployment-parameters.md)
+> 版本：v0.4 | 日期：2026-11-04 | 关联：[01-architecture-design.md](01-architecture-design.md)、[03-deployment-parameters.md](03-deployment-parameters.md)、[04 架构与使用手册](04-architecture-and-operations.md)
 > 状态：**技术栈已确认采用混合方案**（见 §1.1）；展示层根据客户是否启用 IdC 自动选择（见 §1.2，2026-11-03 确认）
 > 指标名和日志格式已对照 **Karpenter（main 文档）、kube-state-metrics、kubelet（master）、vLLM v0.32.0 源码** 核实；升级版本后需要重新核对。
+
+**实现状态（2026-11-04）：本文是设计，大部分还没有实现。**
+
+已实现：
+- 集群内 Prometheus（kube-prometheus-stack 精简版），只给 KEDA 扩缩容用；
+- EKS 控制面日志（api / audit / authenticator / scheduler）写入 CloudWatch Logs；
+- VPC Flow Logs；
+- EKS Node Monitoring Agent（节点和 GPU 健康状态）。
+
+计划中：
+- Fluent Bit 容器日志、kubernetes-event-exporter；
+- ADOT / X-Ray、coldstart-tracer；
+- AMP / AMG、CloudWatch Metrics、Dashboards、Alarms；
+- DCGM Exporter。
+
+和本文设计不同的地方：
+- **Prometheus 不装 node-exporter、不抓 kubelet / API server / CoreDNS**。安全评审：node-exporter 需要 hostNetwork + hostPID，并且会跑在客户业务节点上。
+- **Prometheus 只加载推理命名空间和 monitoring 命名空间里的监控对象**，防止客户业务命名空间伪造扩缩容指标。所以 Karpenter 和 KEDA 自身的指标目前没有采集，落地时要在 monitoring 命名空间里为它们建 ServiceMonitor。
+- 本地保留 6 小时，不 remote_write。
+
+当前能用的观测手段和命令见 [04 §6](04-architecture-and-operations.md#6-可观测性如何使用)。
 
 ---
 
